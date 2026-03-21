@@ -33,9 +33,16 @@ yarn-error.*
 # local env files
 .env*.local
 
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.production
+.env.staging
+
 # typescript
 *.tsbuildinfo
 
 # generated native folders
 /ios
 /android
+.vercel
