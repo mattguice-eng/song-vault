@@ -345,13 +345,26 @@ export default function SongDetailScreen() {
 
       // Get upload body — prefer raw File on web (fetch(uri) can hang in Chrome)
       let uploadBody: Blob | File
+      console.log('[upload] Platform:', Platform.OS, '| hasFile:', !!(file as any).file, '| uri:', file.uri?.substring(0, 50))
       if (Platform.OS === 'web' && (file as any).file instanceof File) {
+        console.log('[upload] Using raw File object, size:', (file as any).file.size)
         uploadBody = (file as any).file
-      } else if (Platform.OS === 'web' && file.uri.startsWith('blob:')) {
-        // Fallback for web blob URIs
-        const response = await fetch(file.uri)
-        if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
-        uploadBody = await response.blob()
+      } else if (Platform.OS === 'web') {
+        // Fallback: read file with a timeout so it doesn't hang forever
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 15000)
+        try {
+          const response = await fetch(file.uri, { signal: controller.signal })
+          clearTimeout(timeout)
+          if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
+          uploadBody = await response.blob()
+        } catch (e: any) {
+          clearTimeout(timeout)
+          if (e.name === 'AbortError') {
+            throw new Error('File read timed out. Please try selecting the file again.')
+          }
+          throw new Error('Could not read the selected file. Please try again.')
+        }
       } else {
         const response = await fetch(file.uri)
         if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
