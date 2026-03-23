@@ -23,6 +23,7 @@ interface ParsedRow {
   index: number
   title: string
   dateWritten: string
+  lyrics: string
   cowriters: ParsedCowriter[]
   artistSplit: string
   errors: string[]
@@ -31,7 +32,14 @@ interface ParsedRow {
   importError?: string
 }
 
-type Step = 'upload' | 'preview' | 'importing' | 'done'
+interface DuplicateMatch {
+  rowIndex: number
+  csvTitle: string
+  existingSong: { id: string; title: string; date_written: string; status: string }
+  keep: boolean // true = import anyway, false = skip
+}
+
+type Step = 'upload' | 'checking_duplicates' | 'duplicates' | 'preview' | 'importing' | 'done'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -77,16 +85,17 @@ export default function ImportScreen() {
   const [editDraft, setEditDraft] = useState<ParsedRow | null>(null)
   const [doneCount, setDoneCount] = useState(0)
   const [parseError, setParseError] = useState('')
+  const [duplicates, setDuplicates] = useState<DuplicateMatch[]>([])
 
   const artistName = activeArtist?.real_name ?? activeArtist?.stage_name ?? ''
 
   // ── Template download ────────────────────────────────────────────────────
   const downloadTemplate = () => {
     const csv = [
-      'date,title,composers,artist_share',
-      '2025-01-15,Song Title Here,Artist Name/Co-Writer One/Co-Writer Two,33.33',
-      '2025-02-20,Another Song,Artist Name/Writer B,50',
-      ',Song With No Date,Artist Name/Writer C,33.33',
+      'date,title,composers,artist_share,lyrics',
+      '2025-01-15,Song Title Here,Artist Name/Co-Writer One/Co-Writer Two,33.33,"Verse 1 lyrics here\nChorus lyrics here"',
+      '2025-02-20,Another Song,Artist Name/Writer B,50,',
+      ',Song With No Date,Artist Name/Writer C,33.33,',
     ].join('\n')
     if (Platform.OS === 'web') {
       const blob = new Blob([csv], { type: 'text/csv' })
@@ -133,6 +142,7 @@ export default function ImportScreen() {
     const titleCol    = findCol(headers, ['title'])
     const composerCol = findCol(headers, ['composer', 'writer', 'co-writer', 'cowriter'])
     const shareCol    = findCol(headers, ['share', 'split', 'percentage', 'pct'])
+    const lyricsCol   = findCol(headers, ['lyrics', 'lyric', 'words'])
 
     if (!titleCol) {
       setParseError('No "title" column found.')
@@ -169,10 +179,13 @@ export default function ImportScreen() {
         }
       }
 
+      const lyrics = lyricsCol ? (raw[lyricsCol] ?? '').trim() : ''
+
       const draft: ParsedRow = {
         index: i,
         title,
         dateWritten,
+        lyrics,
         cowriters,
         artistSplit: isNaN(artistSplitNum) ? '' : String(artistSplitNum),
         errors: [],
@@ -185,7 +198,46 @@ export default function ImportScreen() {
     setRows(parsed)
     setEditingIndex(null)
     setEditDraft(null)
-    setStep('preview')
+    // Check for duplicates before showing preview
+    checkDuplicates(parsed)
+  }
+
+  const checkDuplicates = async (parsed: ParsedRow[]) => {
+    if (!activeArtist) { setStep('preview'); return }
+    setStep('checking_duplicates')
+    try {
+      const { data: existingSongs } = await supabase
+        .from('songs')
+        .select('id, title, date_written, status')
+        .eq('artist_id', activeArtist.id)
+      if (!existingSongs?.length) { setStep('preview'); return }
+
+      const matches: DuplicateMatch[] = []
+      for (const row of parsed) {
+        const csvTitle = row.title.toLowerCase().trim()
+        if (!csvTitle) continue
+        const match = existingSongs.find(
+          (s) => s.title.toLowerCase().trim() === csvTitle
+        )
+        if (match) {
+          matches.push({
+            rowIndex: row.index,
+            csvTitle: row.title,
+            existingSong: match,
+            keep: false, // default to skip duplicates
+          })
+        }
+      }
+      if (matches.length > 0) {
+        setDuplicates(matches)
+        setStep('duplicates')
+      } else {
+        setStep('preview')
+      }
+    } catch {
+      // If check fails, just go to preview
+      setStep('preview')
+    }
   }
 
   // ── Row mutations ────────────────────────────────────────────────────────
@@ -291,6 +343,7 @@ export default function ImportScreen() {
             date_written: row.dateWritten || new Date().toISOString().split('T')[0],
             status: 'logged',
             publishing_deal_id: dealId,
+            ...(row.lyrics ? { lyrics: row.lyrics } : {}),
           })
           .select('id')
           .single()
@@ -382,7 +435,9 @@ export default function ImportScreen() {
                   <Text style={styles.code}>share</Text>
                   {' or '}
                   <Text style={styles.code}>artist_share</Text>
-                  {' — artist\'s % as a number\n\nPublisher exports map automatically. The artist\'s own name is removed from the co-writers list.'}
+                  {' — artist\'s % as a number\n• '}
+                  <Text style={styles.code}>lyrics</Text>
+                  {' (optional)\n\nPublisher exports map automatically. The artist\'s own name is removed from the co-writers list.'}
                 </Text>
                 <TouchableOpacity style={styles.templateBtn} onPress={downloadTemplate}>
                   <Ionicons name="download-outline" size={16} color={Colors.primary} />
@@ -405,6 +460,119 @@ export default function ImportScreen() {
             </>
           )}
         </ScrollView>
+      </SafeAreaView>
+    )
+  }
+
+  // ── Checking duplicates (loading) ───────────────────────────────────────
+  if (step === 'checking_duplicates') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <View style={{ width: 24 }} />
+          <Text style={styles.headerTitle}>Checking for Duplicates…</Text>
+          <View style={{ width: 24 }} />
+        </View>
+        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+          <ActivityIndicator size="large" color={Colors.primary} />
+          <Text style={[styles.centeredText, { marginTop: Spacing.md }]}>
+            Comparing {rows.length} songs against existing catalog…
+          </Text>
+        </View>
+      </SafeAreaView>
+    )
+  }
+
+  // ── Duplicates review step ────────────────────────────────────────────────
+  if (step === 'duplicates') {
+    const skipCount = duplicates.filter((d) => !d.keep).length
+    const keepCount = duplicates.filter((d) => d.keep).length
+
+    const handleContinuePastDuplicates = () => {
+      // Remove rows the user chose to skip
+      const skipIndices = new Set(duplicates.filter((d) => !d.keep).map((d) => d.rowIndex))
+      if (skipIndices.size > 0) {
+        setRows((prev) => prev.filter((r) => !skipIndices.has(r.index)))
+      }
+      setStep('preview')
+    }
+
+    const toggleDuplicate = (rowIndex: number) => {
+      setDuplicates((prev) =>
+        prev.map((d) => d.rowIndex === rowIndex ? { ...d, keep: !d.keep } : d)
+      )
+    }
+
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => { setStep('upload'); setRows([]); setDuplicates([]) }}>
+            <Ionicons name="arrow-back" size={24} color={Colors.textPrimary} />
+          </TouchableOpacity>
+          <Text style={styles.headerTitle}>Duplicates Found</Text>
+          <View style={{ width: 24 }} />
+        </View>
+
+        <View style={[styles.summary, { paddingHorizontal: Spacing.md }]}>
+          <Text style={{ color: Colors.textSecondary, fontSize: 14, lineHeight: 20 }}>
+            <Text style={{ fontWeight: '700', color: Colors.warning }}>{duplicates.length} song{duplicates.length !== 1 ? 's' : ''}</Text>
+            {' '}already exist in this artist's catalog. Choose which to import anyway or skip.
+          </Text>
+        </View>
+
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: Spacing.md, gap: Spacing.sm }}>
+          {duplicates.map((dup) => (
+            <TouchableOpacity
+              key={dup.rowIndex}
+              style={[
+                styles.formatCard,
+                { borderLeftWidth: 3, borderLeftColor: dup.keep ? Colors.success : Colors.textMuted, marginBottom: 0 },
+              ]}
+              onPress={() => toggleDuplicate(dup.rowIndex)}
+              activeOpacity={0.7}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.formatTitle, { marginBottom: 2 }]}>{dup.csvTitle}</Text>
+                  <Text style={{ color: Colors.textMuted, fontSize: 12 }}>
+                    Existing: {dup.existingSong.date_written} · {dup.existingSong.status}
+                  </Text>
+                </View>
+                <View style={{
+                  width: 28, height: 28, borderRadius: 14,
+                  backgroundColor: dup.keep ? Colors.success : Colors.surfaceLight,
+                  alignItems: 'center', justifyContent: 'center',
+                }}>
+                  <Ionicons
+                    name={dup.keep ? 'checkmark' : 'close'}
+                    size={16}
+                    color={dup.keep ? '#fff' : Colors.textMuted}
+                  />
+                </View>
+              </View>
+              <Text style={{ color: dup.keep ? Colors.success : Colors.textMuted, fontSize: 12, marginTop: 4 }}>
+                {dup.keep ? 'Will import (duplicate)' : 'Will skip'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        <View style={{ padding: Spacing.md, gap: Spacing.sm }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'center', gap: Spacing.lg }}>
+            <Text style={{ color: Colors.textMuted, fontSize: 13 }}>
+              Skipping: <Text style={{ fontWeight: '700' }}>{skipCount}</Text>
+            </Text>
+            <Text style={{ color: Colors.textMuted, fontSize: 13 }}>
+              Importing anyway: <Text style={{ fontWeight: '700', color: Colors.success }}>{keepCount}</Text>
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.importBtn, { opacity: 1 }]}
+            onPress={handleContinuePastDuplicates}
+          >
+            <Text style={styles.importBtnText}>Continue to Review</Text>
+          </TouchableOpacity>
+        </View>
       </SafeAreaView>
     )
   }
