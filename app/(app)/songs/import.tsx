@@ -44,7 +44,7 @@ type Step = 'upload' | 'checking_duplicates' | 'duplicates' | 'preview' | 'impor
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const findCol = (headers: string[], patterns: string[]): string | null => {
-  const lower = headers.map((h) => h.trim().toLowerCase())
+  const lower = headers.map((h) => h.trim().toLowerCase().replace(/^"|"$/g, ''))
   for (const p of patterns) {
     const idx = lower.findIndex((h) => h.includes(p))
     if (idx !== -1) return headers[idx]
@@ -117,8 +117,15 @@ export default function ImportScreen() {
         copyToCacheDirectory: true,
       })
       if (result.canceled || !result.assets?.[0]) return
-      const response = await fetch(result.assets[0].uri)
-      const text = await response.text()
+      const asset = result.assets[0]
+      let text: string
+      // On web, prefer reading the raw File object directly for proper encoding
+      if (Platform.OS === 'web' && (asset as any).file instanceof File) {
+        text = await (asset as any).file.text()
+      } else {
+        const response = await fetch(asset.uri)
+        text = await response.text()
+      }
       parseCSV(text)
     } catch (err: any) {
       setParseError(err.message ?? 'Could not read file')
@@ -180,6 +187,7 @@ export default function ImportScreen() {
       }
 
       const lyrics = lyricsCol ? (raw[lyricsCol] ?? '').trim() : ''
+      if (i === 0) console.log('[import] lyricsCol:', lyricsCol, '| headers:', headers, '| lyrics length:', lyrics.length)
 
       const draft: ParsedRow = {
         index: i,
