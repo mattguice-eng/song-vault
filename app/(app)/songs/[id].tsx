@@ -135,6 +135,34 @@ export default function SongDetailScreen() {
 
   useEffect(() => { fetchSong() }, [fetchSong])
 
+  // Reset ALL state when the song id changes (Expo Router reuses the component)
+  useEffect(() => {
+    setSong(null)
+    setLinkedWrite(null)
+    setLoading(true)
+    setUploadingType(null)
+    setEditingLyrics(false)
+    setLyrics('')
+    setSavingLyrics(false)
+    setSubmitting(false)
+    setDeleting(false)
+    setConfirmAction(null)
+    _setActionError('')
+    setSuccessMsg('')
+    setDatePickerVisible(false)
+    setSavingDate(false)
+    setEditingCowriters(false)
+    setCwDraft([])
+    setSavingCowriters(false)
+    setPlayerVisible(false)
+    setPlayerFile(null)
+    setIsPlaying(false)
+    setIsBuffering(false)
+    setPosition(0)
+    setDuration(0)
+    setPlayerError('')
+  }, [id])
+
   // Clean up sound on unmount
   useEffect(() => {
     return () => {
@@ -343,33 +371,44 @@ export default function SongDetailScreen() {
       const ext = file.name.split('.').pop() ?? 'mp3'
       const path = `${song!.artist_id}/${id}/${fileType}_${Date.now()}.${ext}`
 
-      // Get upload body — prefer raw File on web (fetch(uri) can hang in Chrome)
+      // Get upload body — prefer raw File on web (fetch(uri) hangs in Chrome)
       let uploadBody: Blob | File
-      console.log('[upload] Platform:', Platform.OS, '| hasFile:', !!(file as any).file, '| uri:', file.uri?.substring(0, 50))
-      if (Platform.OS === 'web' && (file as any).file instanceof File) {
-        console.log('[upload] Using raw File object, size:', (file as any).file.size)
-        uploadBody = (file as any).file
-      } else if (Platform.OS === 'web') {
-        // Fallback: read file with a timeout so it doesn't hang forever
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 15000)
-        try {
-          const response = await fetch(file.uri, { signal: controller.signal })
-          clearTimeout(timeout)
-          if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
-          uploadBody = await response.blob()
-        } catch (e: any) {
-          clearTimeout(timeout)
-          if (e.name === 'AbortError') {
-            throw new Error('File read timed out. Please try selecting the file again.')
+      console.log('[upload] Platform:', Platform.OS, '| hasFile:', !!(file as any).file, '| uri:', file.uri?.substring(0, 60), '| mimeType:', file.mimeType)
+      if (Platform.OS === 'web') {
+        if ((file as any).file instanceof File) {
+          // Best path: raw File object from document picker
+          console.log('[upload] Using raw File object, size:', (file as any).file.size)
+          uploadBody = (file as any).file
+        } else if (file.uri.startsWith('data:')) {
+          // Data URI — convert to blob
+          console.log('[upload] Converting data URI to blob')
+          const res = await fetch(file.uri)
+          uploadBody = await res.blob()
+        } else {
+          // Last resort: create a hidden file input and read via XHR with timeout
+          console.log('[upload] Fallback: fetch with 15s timeout')
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 15000)
+          try {
+            const response = await fetch(file.uri, { signal: controller.signal })
+            clearTimeout(timeout)
+            if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
+            uploadBody = await response.blob()
+          } catch (e: any) {
+            clearTimeout(timeout)
+            if (e.name === 'AbortError') {
+              throw new Error('File read timed out. Try refreshing the page and uploading again.')
+            }
+            throw new Error('Could not read the selected file. Please try again.')
           }
-          throw new Error('Could not read the selected file. Please try again.')
         }
       } else {
         const response = await fetch(file.uri)
         if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
         uploadBody = await response.blob()
       }
+
+      console.log('[upload] Upload body ready, size:', uploadBody.size, '| uploading to:', path)
 
       const { error: uploadError } = await supabase.storage
         .from('song-files')
