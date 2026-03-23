@@ -8,7 +8,7 @@ const STATUS_CONFIG: Record<SongStatus, { label: string; color: string; bg: stri
   work_tape: { label: 'Work Tape', color: Colors.statusWorkTape, bg: '#F59E0B20' },
   demo_ready: { label: 'Demo Ready', color: Colors.statusDemoReady, bg: '#3B82F620' },
   complete: { label: 'Complete', color: Colors.statusComplete, bg: '#10B98120' },
-  submitted: { label: 'Submitted', color: Colors.statusSubmitted, bg: '#A78BFA20' },
+  submitted: { label: 'Submitted', color: Colors.statusSubmitted, bg: '#8B5CF620' },
 }
 
 interface StatusBadgeProps {

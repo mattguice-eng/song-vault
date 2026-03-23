@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback, useRef } from 'react'
 import {
   View,
   Text,
@@ -15,7 +15,7 @@ import {
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
-import { supabase } from '../../src/lib/supabase'
+import { supabase, withAuthRetry } from '../../src/lib/supabase'
 import { useAuthStore } from '../../src/store/authStore'
 import { SongCard } from '../../src/components/SongCard'
 import { SongWithDetails, Artist, PublishingDeal, Publisher, WriteSession } from '../../src/types/database'
@@ -50,6 +50,7 @@ export default function DashboardScreen() {
   const [writeSessions, setWriteSessions] = useState<WriteSession[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const fetchIdRef = useRef(0) // deduplication: only apply results from the latest fetch
   const [showAllUnlogged, setShowAllUnlogged] = useState(false)
   const [syncingFromDashboard, setSyncingFromDashboard] = useState(false)
   const [calendarConnected, setCalendarConnected] = useState(false)
@@ -97,12 +98,46 @@ export default function DashboardScreen() {
   }, [routeArtistId, artists])
 
   const fetchArtists = async () => {
-    const { data } = await supabase
+    // Fetch artists you own
+    const { data: owned, error: ownedErr } = await supabase
       .from('artists')
       .select('*')
       .eq('manager_id', profile!.id)
       .order('stage_name')
-    setArtists((data ?? []) as Artist[])
+
+    if (ownedErr) console.error('[dashboard] fetch owned artists error:', ownedErr)
+    console.log('[dashboard] owned artists:', owned?.length ?? 0)
+
+    // Fetch artists you're a team member of
+    const { data: teamLinks, error: teamErr } = await supabase
+      .from('artist_team_members')
+      .select('artist_id')
+      .eq('user_id', profile!.id)
+
+    if (teamErr) console.error('[dashboard] fetch team links error:', teamErr)
+
+    const teamArtistIds = (teamLinks ?? []).map(t => t.artist_id)
+    let teamArtists: Artist[] = []
+    if (teamArtistIds.length > 0) {
+      const { data: ta } = await supabase
+        .from('artists')
+        .select('*')
+        .in('id', teamArtistIds)
+        .order('stage_name')
+      teamArtists = (ta ?? []) as Artist[]
+    }
+
+    // Merge, deduplicate by id
+    const ownedList = (owned ?? []) as Artist[]
+    const allIds = new Set(ownedList.map(a => a.id))
+    const merged = [...ownedList]
+    for (const a of teamArtists) {
+      if (!allIds.has(a.id)) {
+        merged.push(a)
+        allIds.add(a.id)
+      }
+    }
+    setArtists(merged)
   }
 
   // Refetch every time this screen comes into focus (catches status changes from song detail)
@@ -114,6 +149,7 @@ export default function DashboardScreen() {
 
   const fetchData = async () => {
     if (!profile) return
+    const thisId = ++fetchIdRef.current // grab a unique id for this fetch
     try {
       // ── Writer: fetch all credited songs (RLS handles the filter) ──────────
       if (isWriter) {
@@ -124,6 +160,7 @@ export default function DashboardScreen() {
           .limit(50)
 
         if (error) throw error
+        if (thisId !== fetchIdRef.current) return // stale fetch, discard
 
         const songList = (data ?? []) as SongWithDetails[]
         setSongs(songList)
@@ -132,7 +169,7 @@ export default function DashboardScreen() {
         setStats({
           totalCatalog: songList.length,
           totalDeal: 0,
-          toSubmit: songList.filter(s => s.status !== 'submitted' && s.status !== 'complete').length,
+          toSubmit: songList.filter(s => s.status !== 'submitted').length,
           needsAttention: 0,
         })
         setLoading(false)
@@ -195,6 +232,7 @@ export default function DashboardScreen() {
       ])
 
       if (songsRes.error) throw songsRes.error
+      if (thisId !== fetchIdRef.current) return // stale fetch, discard
 
       const songList = (songsRes.data ?? []) as SongWithDetails[]
       const dealList = (dealsRes.data ?? []) as DealWithPublisher[]
@@ -389,8 +427,14 @@ export default function DashboardScreen() {
   }
 
   // ─── Write Sessions ──────────────────────────────────────────────────────
-  const upcomingWrites = writeSessions.filter((w) => w.status === 'upcoming')
-  const pastWrites = writeSessions.filter((w) => w.status === 'past')
+  // Upcoming: soonest first (ascending by date)
+  const upcomingWrites = writeSessions
+    .filter((w) => w.status === 'upcoming')
+    .sort((a, b) => a.event_date.localeCompare(b.event_date))
+  // Unlogged/past: most recent first (descending — closest to today at top)
+  const pastWrites = writeSessions
+    .filter((w) => w.status === 'past')
+    .sort((a, b) => b.event_date.localeCompare(a.event_date))
 
   const handleDashboardSync = async () => {
     const artistId = activeArtist?.id ?? artistRecord?.id
@@ -483,10 +527,15 @@ export default function DashboardScreen() {
   })
 
   const handleDismissWrite = async (writeId: string) => {
-    // Remove from local state immediately
-    setWriteSessions(prev => prev.filter(w => w.id !== writeId))
+    const prev = writeSessions
+    // Remove from local state immediately (optimistic)
+    setWriteSessions(ws => ws.filter(w => w.id !== writeId))
     // Delete from database
-    await supabase.from('write_sessions').delete().eq('id', writeId)
+    const { error } = await supabase.from('write_sessions').delete().eq('id', writeId)
+    if (error) {
+      // Revert on failure
+      setWriteSessions(prev)
+    }
   }
 
   const handleLogFromWrite = (ws: WriteSession) => {
@@ -603,21 +652,19 @@ export default function DashboardScreen() {
                 </View>
                 <View style={styles.writeCardActions}>
                   <TouchableOpacity
-                    style={styles.writeLinkBtn}
+                    style={styles.writeIconBtn}
                     onPress={() => handleLinkWrite(ws)}
                   >
-                    <Ionicons name="link-outline" size={14} color={Colors.primary} />
-                    <Text style={styles.writeLinkBtnText}>Link</Text>
+                    <Ionicons name="link-outline" size={16} color={Colors.primary} />
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={styles.writeLogBtn}
+                    style={[styles.writeIconBtn, styles.writeIconBtnPrimary]}
                     onPress={() => handleLogFromWrite(ws)}
                   >
-                    <Ionicons name="add-circle-outline" size={14} color="#fff" />
-                    <Text style={styles.writeLogBtnText}>Log</Text>
+                    <Ionicons name="add" size={16} color="#fff" />
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={styles.writeDismissBtn}
+                    style={styles.writeIconBtn}
                     onPress={() => handleDismissWrite(ws.id)}
                   >
                     <Ionicons name="close" size={14} color={Colors.textMuted} />
@@ -774,17 +821,23 @@ export default function DashboardScreen() {
 
           {/* Stats */}
           <View style={styles.statsRow}>
-            <View style={styles.statCard}>
-              <Text style={styles.statNumber}>{stats.totalCatalog}</Text>
-              <Text style={styles.statLabel}>Total Catalog</Text>
-            </View>
+            <TouchableOpacity
+              style={styles.statCardAccent}
+              onPress={() => router.push({ pathname: '/(app)/songs', params: { filter: 'to_submit' } })}
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.statNumber, { color: Colors.primary }]}>
+                {stats.toSubmit}
+              </Text>
+              <Text style={[styles.statLabel, { color: Colors.primaryLight }]}>To Submit</Text>
+            </TouchableOpacity>
             <View style={styles.statCard}>
               <Text style={[styles.statNumber, { color: Colors.statusWorkTape }]}>{stats.totalDeal}</Text>
               <Text style={styles.statLabel}>Songs This{'\n'}Deal Period</Text>
             </View>
             <View style={styles.statCard}>
-              <Text style={[styles.statNumber, { color: Colors.statusSubmitted }]}>{stats.deliveredDeal}</Text>
-              <Text style={styles.statLabel}>Delivered</Text>
+              <Text style={styles.statNumber}>{stats.totalCatalog}</Text>
+              <Text style={styles.statLabel}>Total Catalog</Text>
             </View>
           </View>
 
@@ -831,6 +884,165 @@ export default function DashboardScreen() {
             )}
           </View>
         </ScrollView>
+
+        {/* Link Write to Song Modal */}
+        <Modal visible={linkModalVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setLinkModalVisible(false)}>
+          <SafeAreaView style={styles.container}>
+            <View style={styles.reviewHeader}>
+              <View>
+                <Text style={styles.reviewHeaderTitle}>Link to Song</Text>
+                {linkingWriteSession && (
+                  <Text style={{ fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 2 }}>
+                    {formatEventDate(linkingWriteSession.event_date)} · {linkingWriteSession.parsed_cowriters.length > 0
+                      ? linkingWriteSession.parsed_cowriters.join(', ')
+                      : linkingWriteSession.raw_title}
+                  </Text>
+                )}
+              </View>
+              <TouchableOpacity onPress={() => setLinkModalVisible(false)}>
+                <Ionicons name="close" size={24} color={Colors.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <View style={{ paddingHorizontal: Spacing.lg, paddingVertical: Spacing.sm }}>
+              <TextInput
+                style={styles.linkSearchInput}
+                placeholder="Search songs..."
+                placeholderTextColor={Colors.textMuted}
+                value={linkSearch}
+                onChangeText={setLinkSearch}
+                autoFocus
+              />
+            </View>
+            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: Spacing.lg, paddingBottom: Spacing.xl }}>
+              {filteredLinkSongs.length === 0 ? (
+                <View style={{ paddingVertical: Spacing.xl, alignItems: 'center' }}>
+                  <Text style={{ color: Colors.textMuted }}>No songs found</Text>
+                </View>
+              ) : (
+                filteredLinkSongs.map((song) => (
+                  <TouchableOpacity
+                    key={song.id}
+                    style={styles.linkSongCard}
+                    onPress={() => handleLinkToSong(song.id)}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.linkSongTitle} numberOfLines={1}>{song.title}</Text>
+                      <Text style={styles.linkSongMeta}>
+                        {new Date(song.date_written + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                        {song.cowriters && song.cowriters.length > 0
+                          ? ` · ${song.cowriters.map((c: any) => c.name).join(', ')}`
+                          : ''}
+                      </Text>
+                    </View>
+                    <Ionicons name="link" size={18} color={Colors.primary} />
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          </SafeAreaView>
+        </Modal>
+
+        {/* Calendar Review Modal */}
+        <Modal visible={reviewModalVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setReviewModalVisible(false)}>
+          <SafeAreaView style={styles.container}>
+            <View style={styles.reviewHeader}>
+              <Text style={styles.reviewHeaderTitle}>Review Calendar Events</Text>
+              <TouchableOpacity onPress={() => setReviewModalVisible(false)}>
+                <Ionicons name="close" size={24} color={Colors.textPrimary} />
+              </TouchableOpacity>
+            </View>
+            <View style={{ paddingHorizontal: Spacing.lg, paddingBottom: Spacing.sm }}>
+              <Text style={{ fontSize: Fonts.sizes.sm, color: Colors.textMuted }}>
+                {selectedEventIds.size} of {previewEvents.length} selected
+              </Text>
+            </View>
+            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: Spacing.lg, paddingBottom: 100 }}>
+              {cancelledSessions.length > 0 && (
+                <View style={{ marginBottom: Spacing.md }}>
+                  <Text style={{ fontSize: Fonts.sizes.xs, fontWeight: '600', color: Colors.error, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: Spacing.sm }}>
+                    Cancelled — will be removed
+                  </Text>
+                  {cancelledSessions.map((cs) => (
+                    <View key={cs.id} style={[styles.reviewCard, { borderColor: Colors.error, opacity: 0.7 }]}>
+                      <Ionicons name="close-circle" size={22} color={Colors.error} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.reviewCardTitle, { textDecorationLine: 'line-through' }]} numberOfLines={1}>{cs.raw_title}</Text>
+                        <Text style={styles.reviewCardMeta}>
+                          {new Date(cs.event_date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                          {cs.parsed_cowriters?.length > 0 ? ` · ${cs.parsed_cowriters.join(', ')}` : ''}
+                        </Text>
+                      </View>
+                      <TouchableOpacity onPress={() => setCancelledSessions(prev => prev.filter(c => c.id !== cs.id))} hitSlop={8}>
+                        <Ionicons name="close" size={20} color={Colors.textMuted} />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              )}
+              {previewEvents.map((event) => {
+                const isSelected = selectedEventIds.has(event.calendar_event_id)
+                const dateStr = new Date(event.event_date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                const timeStr = event.start_time
+                  ? new Date(event.start_time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+                  : ''
+                return (
+                  <TouchableOpacity
+                    key={event.calendar_event_id}
+                    style={[styles.reviewCard, isSelected && styles.reviewCardSelected]}
+                    onPress={() => toggleSyncEventSelection(event.calendar_event_id)}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons
+                      name={isSelected ? 'checkbox' : 'square-outline'}
+                      size={22}
+                      color={isSelected ? Colors.primary : Colors.textMuted}
+                    />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.reviewCardTitle} numberOfLines={2}>{event.raw_title}</Text>
+                      <View style={{ flexDirection: 'row', gap: Spacing.sm, marginTop: 3 }}>
+                        <Text style={styles.reviewCardMeta}>{dateStr}{timeStr ? ` · ${timeStr}` : ''}</Text>
+                        {event.likely_write && !event.previously_dismissed && (
+                          <View style={styles.reviewLikelyBadge}>
+                            <Text style={styles.reviewLikelyText}>Likely Write</Text>
+                          </View>
+                        )}
+                        {event.previously_dismissed && (
+                          <View style={styles.reviewSkippedBadge}>
+                            <Text style={styles.reviewSkippedText}>Skipped</Text>
+                          </View>
+                        )}
+                      </View>
+                      {event.parsed_cowriters.length > 0 && (
+                        <Text style={styles.reviewCardCowriters}>
+                          {event.parsed_cowriters.join(', ')}
+                        </Text>
+                      )}
+                    </View>
+                  </TouchableOpacity>
+                )
+              })}
+            </ScrollView>
+            <View style={styles.reviewImportFooter}>
+              <TouchableOpacity
+                style={[styles.reviewImportBtn, (importingEvents || (selectedEventIds.size === 0 && cancelledSessions.length === 0)) && { opacity: 0.5 }]}
+                onPress={handleDashboardImport}
+                disabled={importingEvents || (selectedEventIds.size === 0 && cancelledSessions.length === 0)}
+              >
+                {importingEvents ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.reviewImportBtnText}>
+                    {selectedEventIds.size > 0
+                      ? `Import ${selectedEventIds.size} Event${selectedEventIds.size !== 1 ? 's' : ''}${cancelledSessions.length > 0 ? ` & Remove ${cancelledSessions.length}` : ''}`
+                      : cancelledSessions.length > 0
+                        ? `Remove ${cancelledSessions.length} Cancelled`
+                        : 'Import 0 Events'}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </SafeAreaView>
+        </Modal>
       </SafeAreaView>
     )
   }
@@ -917,10 +1129,16 @@ export default function DashboardScreen() {
 
         {/* Stats */}
         <View style={styles.statsRow}>
-          <View style={styles.statCard}>
-            <Text style={styles.statNumber}>{stats.totalCatalog}</Text>
-            <Text style={styles.statLabel}>Total Catalog</Text>
-          </View>
+          <TouchableOpacity
+            style={styles.statCardAccent}
+            onPress={() => router.push({ pathname: '/(app)/songs', params: { filter: 'to_submit' } })}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.statNumber, { color: Colors.primary }]}>
+              {stats.toSubmit}
+            </Text>
+            <Text style={[styles.statLabel, { color: Colors.primaryLight }]}>To Submit</Text>
+          </TouchableOpacity>
           <View style={styles.statCard}>
             <Text style={[styles.statNumber, { color: Colors.statusWorkTape }]}>
               {stats.totalDeal}
@@ -928,10 +1146,8 @@ export default function DashboardScreen() {
             <Text style={styles.statLabel}>Songs This{'\n'}Deal Period</Text>
           </View>
           <View style={styles.statCard}>
-            <Text style={[styles.statNumber, { color: Colors.warning }]}>
-              {stats.toSubmit}
-            </Text>
-            <Text style={styles.statLabel}>To Submit</Text>
+            <Text style={styles.statNumber}>{stats.totalCatalog}</Text>
+            <Text style={styles.statLabel}>Total Catalog</Text>
           </View>
         </View>
 
@@ -1202,6 +1418,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center',
     backgroundColor: Colors.surface, borderRadius: Radius.lg,
     borderWidth: 1, borderColor: Colors.border, overflow: 'hidden',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15, shadowRadius: 6, elevation: 3,
   },
   artistPickerMain: {
     flexDirection: 'row', alignItems: 'center',
@@ -1214,7 +1432,7 @@ const styles = StyleSheet.create({
   artistPickerNoAccess: { fontSize: Fonts.sizes.xs, color: Colors.warning, marginTop: 2 },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.sm },
   manageButton: {
-    width: 36, height: 36, borderRadius: Radius.full,
+    width: 38, height: 38, borderRadius: Radius.full,
     backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.border,
     alignItems: 'center', justifyContent: 'center',
   },
@@ -1262,37 +1480,44 @@ const styles = StyleSheet.create({
   headerAvatarInitial: { fontSize: Fonts.sizes.md, fontWeight: '800', color: Colors.primary },
   artistSwitcher: { flexDirection: 'row', alignItems: 'center', marginBottom: 2 },
   artistSwitcherText: { fontSize: Fonts.sizes.sm, color: Colors.primary, fontWeight: '600' },
-  greeting: { fontSize: Fonts.sizes.md, color: Colors.textMuted },
-  name: { fontSize: Fonts.sizes.xxl, fontWeight: '800', color: Colors.textPrimary, letterSpacing: -0.5 },
+  greeting: { fontSize: Fonts.sizes.md, color: Colors.textSecondary },
+  name: { fontSize: Fonts.sizes.xxxl, fontWeight: '800', color: Colors.textPrimary, letterSpacing: -0.8 },
   writerSubline: { fontSize: Fonts.sizes.sm, color: Colors.textMuted, marginTop: 2 },
   artistSubline: { fontSize: Fonts.sizes.sm, color: Colors.primary, marginTop: 2, fontWeight: '600' },
   newSongButton: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
-    backgroundColor: Colors.primary, paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm, borderRadius: Radius.full,
+    backgroundColor: Colors.primary, paddingHorizontal: 18,
+    paddingVertical: 10, borderRadius: Radius.full,
+    shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3, shadowRadius: 8, elevation: 6,
   },
   newSongText: { color: '#fff', fontSize: Fonts.sizes.sm, fontWeight: '700' },
   attentionBanner: {
     flexDirection: 'row', alignItems: 'center', gap: Spacing.sm,
-    backgroundColor: `${Colors.warning}15`, borderWidth: 1,
-    borderColor: `${Colors.warning}40`, borderRadius: Radius.md,
+    backgroundColor: `${Colors.warning}10`, borderWidth: 1,
+    borderColor: `${Colors.warning}30`, borderRadius: Radius.lg,
     padding: Spacing.md, marginBottom: Spacing.lg,
   },
   attentionText: { flex: 1, fontSize: Fonts.sizes.sm, color: Colors.warning, lineHeight: 18 },
   statsRow: { flexDirection: 'row', gap: Spacing.sm, marginBottom: Spacing.xl },
   statCard: {
-    flex: 1, backgroundColor: Colors.surface, borderRadius: Radius.md,
+    flex: 1, backgroundColor: Colors.surface, borderRadius: Radius.lg,
     padding: Spacing.md, alignItems: 'center', borderWidth: 1, borderColor: Colors.border,
   },
+  statCardAccent: {
+    flex: 1, borderRadius: Radius.lg,
+    padding: Spacing.md, alignItems: 'center',
+    backgroundColor: `${Colors.primary}12`, borderWidth: 1, borderColor: `${Colors.primary}30`,
+  },
   statNumber: { fontSize: Fonts.sizes.xxl, fontWeight: '800', color: Colors.textPrimary },
-  statLabel: { fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 2, fontWeight: '500' },
+  statLabel: { fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 4, fontWeight: '600', textAlign: 'center' },
   section: { marginBottom: Spacing.lg },
   sectionHeader: {
     flexDirection: 'row', justifyContent: 'space-between',
     alignItems: 'center', marginBottom: Spacing.md,
   },
-  sectionTitle: { fontSize: Fonts.sizes.lg, fontWeight: '700', color: Colors.textPrimary },
-  seeAll: { fontSize: Fonts.sizes.sm, color: Colors.primary, fontWeight: '600' },
+  sectionTitle: { fontSize: Fonts.sizes.lg, fontWeight: '700', color: Colors.textPrimary, letterSpacing: -0.3 },
+  seeAll: { fontSize: Fonts.sizes.sm, color: Colors.primary, fontWeight: '700' },
   emptyState: { alignItems: 'center', paddingVertical: Spacing.xxl, gap: Spacing.sm },
   emptyTitle: { fontSize: Fonts.sizes.lg, fontWeight: '700', color: Colors.textSecondary },
   emptySubtitle: {
@@ -1301,11 +1526,13 @@ const styles = StyleSheet.create({
   },
   emptyButton: {
     marginTop: Spacing.sm, backgroundColor: Colors.primary,
-    paddingHorizontal: Spacing.lg, paddingVertical: Spacing.sm, borderRadius: Radius.full,
+    paddingHorizontal: Spacing.lg, paddingVertical: 10, borderRadius: Radius.full,
+    shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3, shadowRadius: 8, elevation: 6,
   },
   emptyButtonText: { color: '#fff', fontWeight: '700', fontSize: Fonts.sizes.md },
   dealProgress: {
-    backgroundColor: Colors.surfaceElevated, borderRadius: Radius.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
     padding: Spacing.md, marginBottom: Spacing.sm,
     borderWidth: 1, borderColor: Colors.border,
   },
@@ -1316,13 +1543,13 @@ const styles = StyleSheet.create({
   dealCount: { fontSize: Fonts.sizes.sm, fontWeight: '800' },
   dealTrack: {
     height: 6, borderRadius: 3,
-    backgroundColor: Colors.border, overflow: 'hidden',
+    backgroundColor: `${Colors.primary}15`, overflow: 'hidden',
   },
   dealFill: { height: '100%', borderRadius: 3 },
 
   // Write Sessions
   writeCard: {
-    backgroundColor: Colors.surfaceElevated, borderRadius: Radius.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
     padding: Spacing.md, marginBottom: Spacing.sm,
     borderWidth: 1, borderColor: Colors.border,
   },
@@ -1334,41 +1561,32 @@ const styles = StyleSheet.create({
   writeCardLocation: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 4 },
   writeCardLocationText: { fontSize: Fonts.sizes.xs, color: Colors.textMuted },
   writeCardActions: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
+    flexDirection: 'row', alignItems: 'center', gap: 8,
   },
-  writeLogBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: Colors.primary, borderRadius: Radius.sm,
-    paddingHorizontal: Spacing.sm, paddingVertical: 6,
-  },
-  writeLogBtnText: { fontSize: Fonts.sizes.xs, fontWeight: '700', color: '#fff' },
-  writeLinkBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 3,
-    borderRadius: Radius.sm, paddingHorizontal: 8, paddingVertical: 6,
-    backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.primary,
-  },
-  writeLinkBtnText: { fontSize: Fonts.sizes.xs, fontWeight: '700', color: Colors.primary },
-  writeDismissBtn: {
-    width: 28, height: 28, borderRadius: Radius.full,
+  writeIconBtn: {
+    width: 30, height: 30, borderRadius: Radius.full,
     backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.border,
     justifyContent: 'center', alignItems: 'center',
   },
+  writeIconBtnPrimary: {
+    backgroundColor: Colors.primary, borderColor: Colors.primary,
+  },
   linkSearchInput: {
-    backgroundColor: Colors.surface, borderRadius: Radius.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
     borderWidth: 1, borderColor: Colors.border,
-    paddingHorizontal: Spacing.md, paddingVertical: 10,
+    paddingHorizontal: Spacing.md, paddingVertical: 12,
     fontSize: Fonts.sizes.sm, color: Colors.textPrimary,
   },
   linkSongCard: {
     flexDirection: 'row', alignItems: 'center', gap: Spacing.sm,
     padding: Spacing.md, marginBottom: Spacing.sm,
-    backgroundColor: Colors.surface, borderRadius: Radius.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
     borderWidth: 1, borderColor: Colors.border,
   },
   linkSongTitle: { fontSize: Fonts.sizes.sm, fontWeight: '600', color: Colors.textPrimary },
   linkSongMeta: { fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 2 },
   unloggedContainer: {
-    backgroundColor: Colors.surface, borderRadius: Radius.lg,
+    backgroundColor: Colors.surface, borderRadius: Radius.xl,
     borderWidth: 1, borderColor: Colors.border,
     padding: Spacing.md, marginBottom: Spacing.lg,
   },
@@ -1393,16 +1611,16 @@ const styles = StyleSheet.create({
   // Dashboard sync button
   dashboardSyncBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 3,
-    paddingHorizontal: 8, paddingVertical: 4,
-    borderRadius: Radius.sm, backgroundColor: `${Colors.primary}10`,
-    borderWidth: 1, borderColor: `${Colors.primary}30`,
+    paddingHorizontal: 10, paddingVertical: 5,
+    borderRadius: Radius.full, backgroundColor: `${Colors.primary}10`,
+    borderWidth: 1, borderColor: `${Colors.primary}25`,
   },
   dashboardSyncText: { fontSize: 11, fontWeight: '700', color: Colors.primary },
   standaloneSyncBtn: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
-    paddingVertical: Spacing.sm,
-    backgroundColor: Colors.surface, borderRadius: Radius.md,
-    borderWidth: 1, borderColor: Colors.border,
+    paddingVertical: 10,
+    backgroundColor: `${Colors.primary}10`, borderRadius: Radius.full,
+    borderWidth: 1, borderColor: `${Colors.primary}30`,
   },
   standaloneSyncText: { fontSize: Fonts.sizes.sm, fontWeight: '600', color: Colors.primary },
   // Review modal
@@ -1415,10 +1633,10 @@ const styles = StyleSheet.create({
   reviewCard: {
     flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.sm,
     padding: Spacing.md, marginBottom: Spacing.sm,
-    backgroundColor: Colors.surface, borderRadius: Radius.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
     borderWidth: 1, borderColor: Colors.border,
   },
-  reviewCardSelected: { borderColor: Colors.primary, backgroundColor: `${Colors.primary}08` },
+  reviewCardSelected: { borderColor: `${Colors.primary}60`, backgroundColor: `${Colors.primary}10` },
   reviewCardTitle: { fontSize: Fonts.sizes.sm, fontWeight: '600', color: Colors.textPrimary },
   reviewCardMeta: { fontSize: Fonts.sizes.xs, color: Colors.textMuted },
   reviewCardCowriters: { fontSize: Fonts.sizes.xs, color: Colors.textSecondary, marginTop: 4 },
@@ -1437,9 +1655,28 @@ const styles = StyleSheet.create({
     padding: Spacing.lg, borderTopWidth: 1, borderTopColor: Colors.border,
     backgroundColor: Colors.background,
   },
+  playlistShortcut: {
+    flexDirection: 'row', alignItems: 'center', gap: Spacing.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
+    borderWidth: 1, borderColor: Colors.border,
+    padding: Spacing.md, marginBottom: Spacing.lg,
+  },
+  playlistShortcutIcon: {
+    width: 38, height: 38, borderRadius: Radius.md,
+    backgroundColor: `${Colors.primary}12`,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  playlistShortcutTitle: {
+    fontSize: Fonts.sizes.sm, fontWeight: '700', color: Colors.textPrimary,
+  },
+  playlistShortcutSub: {
+    fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 1,
+  },
   reviewImportBtn: {
-    backgroundColor: Colors.primary, borderRadius: Radius.md,
+    backgroundColor: Colors.primary, borderRadius: Radius.full,
     paddingVertical: 14, alignItems: 'center',
+    shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3, shadowRadius: 8, elevation: 6,
   },
   reviewImportBtnText: { fontSize: Fonts.sizes.md, fontWeight: '700', color: '#fff' },
 })

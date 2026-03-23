@@ -95,18 +95,26 @@ export default function NewSongScreen() {
     let resolvedArtistId: string | null = null
     let artistRecord: any = null
 
-    if (isManager && activeArtist) {
-      resolvedArtistId = activeArtist.id
-      // Fetch full artist record (activeArtist may be partial)
-      const { data } = await supabase.from('artists').select('*').eq('id', activeArtist.id).single()
-      artistRecord = data ?? activeArtist
-    } else {
-      const { data } = await supabase.from('artists').select('*').eq('user_id', profile!.id).single()
-      resolvedArtistId = data?.id ?? null
-      artistRecord = data
+    try {
+      if (isManager && activeArtist) {
+        resolvedArtistId = activeArtist.id
+        // Fetch full artist record (activeArtist may be partial)
+        const { data } = await supabase.from('artists').select('*').eq('id', activeArtist.id).single()
+        artistRecord = data ?? activeArtist
+      } else {
+        const { data } = await supabase.from('artists').select('*').eq('user_id', profile!.id).single()
+        resolvedArtistId = data?.id ?? null
+        artistRecord = data
+      }
+    } catch {
+      setErrors({ title: 'Failed to load artist data. Please go back and try again.' })
+      return
     }
 
-    if (!resolvedArtistId || !artistRecord) return
+    if (!resolvedArtistId || !artistRecord) {
+      setErrors({ title: 'No artist profile found. Please set up your artist profile first.' })
+      return
+    }
     setArtistId(resolvedArtistId)
 
     // Active deal + publisher name

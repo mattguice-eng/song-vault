@@ -44,25 +44,30 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   setLoading: (loading) => set({ loading }),
 
   fetchProfile: async (userId: string) => {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId)
-      .single()
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single()
 
-    if (!error && data) {
-      const profile = data as Profile
-      set({ profile })
+      if (!error && data) {
+        const profile = data as Profile
+        set({ profile })
 
-      // If writer, also fetch their linked songwriter entry
-      if (profile.role === 'writer') {
-        const { data: swData } = await supabase
-          .from('songwriters')
-          .select('*')
-          .eq('user_id', userId)
-          .single()
-        set({ songwriterProfile: swData ? (swData as Songwriter) : null })
+        // If writer, also fetch their linked songwriter entry
+        if (profile.role === 'writer') {
+          const { data: swData } = await supabase
+            .from('songwriters')
+            .select('*')
+            .eq('user_id', userId)
+            .single()
+          set({ songwriterProfile: swData ? (swData as Songwriter) : null })
+        }
       }
+    } catch {
+      // Profile fetch failed — app will still load but profile will be null
+      console.warn('Failed to fetch profile for user:', userId)
     }
   },
 

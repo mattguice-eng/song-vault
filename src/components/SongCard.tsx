@@ -8,17 +8,17 @@ import { Colors, Radius, Spacing, Fonts } from '../utils/constants'
 interface SongCardProps {
   song: SongWithDetails
   onPress: () => void
+  onAddToPlaylist?: () => void
   showArtist?: boolean
-  artistName?: string // real_name or stage_name of the active artist to show their split
+  artistName?: string
 }
 
-export const SongCard: React.FC<SongCardProps> = ({ song, onPress, showArtist = false, artistName }) => {
+export const SongCard: React.FC<SongCardProps> = ({ song, onPress, onAddToPlaylist, showArtist = false, artistName }) => {
   const cowriterCount = song.cowriters?.length ?? 0
 
   const artistSplit = artistName
     ? song.cowriters?.find(c => c.name.toLowerCase() === artistName.toLowerCase())?.split_percentage ?? null
     : null
-  const hasFiles = (song.files?.length ?? 0) > 0
   const hasWorkTape = song.files?.some((f) => f.file_type === 'work_tape')
   const hasDemo = song.files?.some((f) => f.file_type === 'demo')
 
@@ -30,73 +30,71 @@ export const SongCard: React.FC<SongCardProps> = ({ song, onPress, showArtist = 
 
   return (
     <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.8}>
-      <View style={styles.header}>
-        <View style={styles.titleRow}>
-          <Text style={styles.title} numberOfLines={1}>
-            {song.title}
-          </Text>
-          <Ionicons name="chevron-forward" size={16} color={Colors.textMuted} />
-        </View>
+      {/* Row 1: Title + Status badge */}
+      <View style={styles.topRow}>
+        <Text style={styles.title} numberOfLines={1}>{song.title}</Text>
+        {onAddToPlaylist && (
+          <TouchableOpacity
+            style={styles.addBtn}
+            onPress={(e) => {
+              e.stopPropagation()
+              onAddToPlaylist()
+            }}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <Ionicons name="add-circle-outline" size={18} color={Colors.primary} />
+          </TouchableOpacity>
+        )}
         <StatusBadge status={song.status} />
       </View>
 
-      <View style={styles.meta}>
-        <View style={styles.metaItem}>
-          <Ionicons name="calendar-outline" size={13} color={Colors.textMuted} />
-          <Text style={styles.metaText}>{dateWritten}</Text>
-        </View>
-
+      {/* Row 2: Date, writers, split */}
+      <View style={styles.metaRow}>
+        <Ionicons name="calendar-outline" size={12} color={Colors.textMuted} />
+        <Text style={styles.metaText}>{dateWritten}</Text>
         {cowriterCount > 0 && (
-          <View style={styles.metaItem}>
-            <Ionicons name="people-outline" size={13} color={Colors.textMuted} />
+          <>
+            <Text style={styles.metaDot}>·</Text>
+            <Ionicons name="people-outline" size={12} color={Colors.textMuted} />
             <Text style={styles.metaText}>
-              {cowriterCount} co-writer{cowriterCount !== 1 ? 's' : ''}
+              {cowriterCount} writer{cowriterCount !== 1 ? 's' : ''}
             </Text>
-          </View>
+          </>
         )}
-
         {artistSplit !== null && (
-          <View style={styles.metaItem}>
-            <Ionicons name="pie-chart-outline" size={13} color={Colors.primary} />
+          <>
+            <Text style={styles.metaDot}>·</Text>
             <Text style={[styles.metaText, styles.splitText]}>
               {Number.isInteger(artistSplit) ? artistSplit : parseFloat(artistSplit.toFixed(2))}%
             </Text>
-          </View>
+          </>
         )}
-
         {showArtist && song.artist && (
-          <View style={styles.metaItem}>
-            <Ionicons name="person-outline" size={13} color={Colors.textMuted} />
+          <>
+            <Text style={styles.metaDot}>·</Text>
             <Text style={styles.metaText}>{song.artist.stage_name}</Text>
-          </View>
+          </>
         )}
       </View>
 
-      <View style={styles.fileIndicators}>
+      {/* Row 3: File tags */}
+      <View style={styles.fileRow}>
         <View style={[styles.fileTag, hasWorkTape ? styles.fileTagActive : styles.fileTagInactive]}>
-          <Ionicons
-            name="mic-outline"
-            size={11}
-            color={hasWorkTape ? Colors.statusWorkTape : Colors.textMuted}
-          />
-          <Text style={[styles.fileTagText, !hasWorkTape && styles.fileTagTextInactive]}>
-            Work Tape
-          </Text>
+          <Ionicons name="mic-outline" size={10} color={hasWorkTape ? Colors.statusWorkTape : Colors.textMuted} />
+          <Text style={[styles.fileTagText, !hasWorkTape && styles.fileTagTextInactive]}>WT</Text>
         </View>
         <View style={[styles.fileTag, hasDemo ? styles.fileTagActive : styles.fileTagInactive]}>
-          <Ionicons
-            name="musical-note-outline"
-            size={11}
-            color={hasDemo ? Colors.statusDemoReady : Colors.textMuted}
-          />
+          <Ionicons name="musical-note-outline" size={10} color={hasDemo ? Colors.statusDemoReady : Colors.textMuted} />
           <Text style={[styles.fileTagText, !hasDemo && styles.fileTagTextInactive]}>Demo</Text>
         </View>
         {song.lyrics && (
           <View style={[styles.fileTag, styles.fileTagActive]}>
-            <Ionicons name="document-text-outline" size={11} color={Colors.statusComplete} />
+            <Ionicons name="document-text-outline" size={10} color={Colors.statusComplete} />
             <Text style={styles.fileTagText}>Lyrics</Text>
           </View>
         )}
+        <View style={{ flex: 1 }} />
+        <Ionicons name="chevron-forward" size={14} color={Colors.textMuted} />
       </View>
     </TouchableOpacity>
   )
@@ -106,56 +104,58 @@ const styles = StyleSheet.create({
   card: {
     backgroundColor: Colors.surface,
     borderRadius: Radius.lg,
-    padding: Spacing.md,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: 12,
     marginBottom: Spacing.sm,
     borderWidth: 1,
     borderColor: Colors.border,
   },
-  header: {
-    marginBottom: Spacing.sm,
-    gap: Spacing.xs,
-  },
-  titleRow: {
+  topRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: Spacing.sm,
+    marginBottom: 6,
   },
   title: {
-    fontSize: Fonts.sizes.lg,
+    fontSize: Fonts.sizes.md,
     fontWeight: '700',
     color: Colors.textPrimary,
     flex: 1,
-    marginRight: Spacing.xs,
   },
-  meta: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: Spacing.sm,
-    marginBottom: Spacing.sm,
+  addBtn: {
+    padding: 2,
   },
-  metaItem: {
+  metaRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
+    marginBottom: 8,
   },
   metaText: {
     fontSize: Fonts.sizes.xs,
     color: Colors.textMuted,
   },
+  metaDot: {
+    fontSize: Fonts.sizes.xs,
+    color: Colors.textMuted,
+    marginHorizontal: 1,
+  },
   splitText: {
     color: Colors.primary,
     fontWeight: '600',
   },
-  fileIndicators: {
+  fileRow: {
     flexDirection: 'row',
-    gap: Spacing.xs,
+    alignItems: 'center',
+    gap: 6,
   },
   fileTag: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 3,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
     borderRadius: Radius.full,
   },
   fileTagActive: {
@@ -167,9 +167,9 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
   },
   fileTagText: {
-    fontSize: Fonts.sizes.xs,
+    fontSize: 10,
     color: Colors.textSecondary,
-    fontWeight: '500',
+    fontWeight: '600',
   },
   fileTagTextInactive: {
     color: Colors.textMuted,

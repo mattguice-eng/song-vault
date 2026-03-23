@@ -1,26 +1,27 @@
 export const Colors = {
-  // Backgrounds
-  background: '#0D0D0D',
-  surface: '#1A1A1A',
-  surfaceElevated: '#242424',
-  border: '#2E2E2E',
+  // Backgrounds — deep navy
+  background: '#0B0E1A',
+  surface: '#131729',
+  surfaceElevated: '#1A1F35',
+  border: '#252B45',
 
-  // Brand
-  primary: '#A78BFA',       // soft violet
-  primaryDark: '#7C3AED',
-  primaryLight: '#DDD6FE',
+  // Brand — rich purple/violet
+  primary: '#8B5CF6',
+  primaryDark: '#6D28D9',
+  primaryLight: '#C4B5FD',
+  primaryGlow: '#8B5CF620',
 
   // Status colors
-  statusLogged: '#6B7280',
+  statusLogged: '#64748B',
   statusWorkTape: '#F59E0B',
   statusDemoReady: '#3B82F6',
   statusComplete: '#10B981',
-  statusSubmitted: '#A78BFA',
+  statusSubmitted: '#8B5CF6',
 
   // Text
-  textPrimary: '#F9FAFB',
-  textSecondary: '#9CA3AF',
-  textMuted: '#6B7280',
+  textPrimary: '#F1F5F9',
+  textSecondary: '#94A3B8',
+  textMuted: '#64748B',
 
   // Feedback
   success: '#10B981',
@@ -52,9 +53,10 @@ export const Spacing = {
 }
 
 export const Radius = {
-  sm: 6,
-  md: 12,
-  lg: 16,
+  sm: 8,
+  md: 14,
+  lg: 20,
+  xl: 24,
   full: 999,
 }
 

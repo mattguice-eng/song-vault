@@ -28,12 +28,41 @@ export default function ArtistsScreen() {
   const [successMsg, setSuccessMsg] = useState('')
 
   const fetchArtists = async () => {
-    const { data } = await supabase
+    // Fetch artists you own
+    const { data: owned } = await supabase
       .from('artists')
       .select('*')
       .eq('manager_id', profile?.id)
       .order('stage_name')
-    setArtists((data ?? []) as Artist[])
+
+    // Fetch artists you're a team member of
+    const { data: teamLinks } = await supabase
+      .from('artist_team_members')
+      .select('artist_id')
+      .eq('user_id', profile?.id)
+
+    const teamArtistIds = (teamLinks ?? []).map((t: any) => t.artist_id)
+    let teamArtists: Artist[] = []
+    if (teamArtistIds.length > 0) {
+      const { data: ta } = await supabase
+        .from('artists')
+        .select('*')
+        .in('id', teamArtistIds)
+        .order('stage_name')
+      teamArtists = (ta ?? []) as Artist[]
+    }
+
+    // Merge, deduplicate
+    const ownedList = (owned ?? []) as Artist[]
+    const allIds = new Set(ownedList.map(a => a.id))
+    const merged = [...ownedList]
+    for (const a of teamArtists) {
+      if (!allIds.has(a.id)) {
+        merged.push(a)
+        allIds.add(a.id)
+      }
+    }
+    setArtists(merged)
     setLoading(false)
   }
 

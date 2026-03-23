@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
   TextInput, ActivityIndicator, Linking, Modal, Animated, Image,
+  Share, Alert,
 } from 'react-native'
 import { router, useLocalSearchParams } from 'expo-router'
 import { Platform } from 'react-native'
@@ -9,7 +10,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { Audio, AVPlaybackStatus } from 'expo-av'
-import { supabase } from '../../../src/lib/supabase'
+import { supabase, withAuthRetry } from '../../../src/lib/supabase'
 import { useAuthStore } from '../../../src/store/authStore'
 import { StatusBadge } from '../../../src/components/StatusBadge'
 import { Button } from '../../../src/components/Button'
@@ -30,8 +31,15 @@ export default function SongDetailScreen() {
   const [lyrics, setLyrics] = useState('')
   const [savingLyrics, setSavingLyrics] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [confirmAction, setConfirmAction] = useState<'complete' | 'submit' | 'delete_worktape' | 'delete_song' | null>(null)
-  const [actionError, setActionError] = useState('')
+  const [actionError, _setActionError] = useState('')
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const setActionError = (msg: string) => {
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current)
+    _setActionError(msg)
+    if (msg) errorTimerRef.current = setTimeout(() => _setActionError(''), 6000)
+  }
   const [successMsg, setSuccessMsg] = useState('')
   const [datePickerVisible, setDatePickerVisible] = useState(false)
   const [savingDate, setSavingDate] = useState(false)
@@ -48,6 +56,10 @@ export default function SongDetailScreen() {
     searchQuery: string; searchResults: any[]; searching: boolean; showResults: boolean; linked: boolean
   }[]>([])
   const [savingCowriters, setSavingCowriters] = useState(false)
+
+  const [playlistPickerVisible, setPlaylistPickerVisible] = useState(false)
+  const [playlists, setPlaylists] = useState<{ id: string; name: string; song_count: number }[]>([])
+  const [addingToPlaylist, setAddingToPlaylist] = useState<string | null>(null)
 
   const isWriter = profile?.role === 'writer'
 
@@ -75,36 +87,48 @@ export default function SongDetailScreen() {
   const slideAnim = useRef(new Animated.Value(400)).current
 
   const fetchSong = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('songs')
-      .select(`
-        *,
-        cowriters(*),
-        files:song_files(*),
-        artist:artists(*),
-        publishing_deal:publishing_deals(*, publisher:publishers(*))
-      `)
-      .eq('id', id)
-      .single()
+    try {
+      const { data, error } = await withAuthRetry(() =>
+        supabase
+          .from('songs')
+          .select(`
+            *,
+            cowriters(*),
+            files:song_files(*),
+            artist:artists(*),
+            publishing_deal:publishing_deals(*, publisher:publishers(*))
+          `)
+          .eq('id', id)
+          .single()
+      )
 
-    if (!error && data) {
-      setSong(data as SongWithDetails)
-      setLyrics(data.lyrics ?? '')
-      // Fetch linked write session
-      supabase.from('write_sessions')
-        .select('event_date, raw_title, location, parsed_cowriters')
-        .eq('song_id', data.id)
-        .maybeSingle()
-        .then(({ data: ws }) => setLinkedWrite(ws))
-      // Backfill release date for tracks linked before this field existed
-      if (data.spotify_track_id && !data.spotify_release_date) {
-        getSpotifyTrack(data.spotify_track_id).then((track) => {
-          if (track?.releaseDate) {
-            supabase.from('songs').update({ spotify_release_date: track.releaseDate }).eq('id', data.id)
-            setSong((prev) => prev ? { ...prev, spotify_release_date: track.releaseDate } : prev)
-          }
-        })
+      if (error) {
+        setActionError('Failed to load song. Please go back and try again.')
+        setLoading(false)
+        return
       }
+
+      if (data) {
+        setSong(data as SongWithDetails)
+        setLyrics(data.lyrics ?? '')
+        // Fetch linked write session
+        supabase.from('write_sessions')
+          .select('event_date, raw_title, location, parsed_cowriters')
+          .eq('song_id', data.id)
+          .maybeSingle()
+          .then(({ data: ws }) => setLinkedWrite(ws))
+        // Backfill release date for tracks linked before this field existed
+        if (data.spotify_track_id && !data.spotify_release_date) {
+          getSpotifyTrack(data.spotify_track_id).then((track) => {
+            if (track?.releaseDate) {
+              supabase.from('songs').update({ spotify_release_date: track.releaseDate }).eq('id', data.id)
+              setSong((prev) => prev ? { ...prev, spotify_release_date: track.releaseDate } : prev)
+            }
+          })
+        }
+      }
+    } catch (err: any) {
+      setActionError('Failed to load song. Please go back and try again.')
     }
     setLoading(false)
   }, [id])
@@ -294,51 +318,83 @@ export default function SongDetailScreen() {
   const progress = duration > 0 ? displayPosition / duration : 0
 
   const handleUploadFile = async (fileType: 'work_tape' | 'demo') => {
+    setActionError('')
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['audio/*'],
+        type: Platform.OS === 'web'
+          ? ['audio/*', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.mp4']
+          : ['audio/*'],
         copyToCacheDirectory: true,
       })
 
       if (result.canceled || !result.assets?.[0]) return
 
       const file = result.assets[0]
+
+      // Validate file size (max 50MB)
+      if (file.size && file.size > 50 * 1024 * 1024) {
+        setActionError('File is too large. Maximum size is 50MB.')
+        return
+      }
+
       setUploadingType(fileType)
 
       // Upload to Supabase Storage
-      const ext = file.name.split('.').pop()
+      const ext = file.name.split('.').pop() ?? 'mp3'
       const path = `${song!.artist_id}/${id}/${fileType}_${Date.now()}.${ext}`
 
-      const response = await fetch(file.uri)
-      const blob = await response.blob()
+      // Get upload body — prefer raw File on web (fetch(uri) can hang in Chrome)
+      let uploadBody: Blob | File
+      if (Platform.OS === 'web' && (file as any).file instanceof File) {
+        uploadBody = (file as any).file
+      } else if (Platform.OS === 'web' && file.uri.startsWith('blob:')) {
+        // Fallback for web blob URIs
+        const response = await fetch(file.uri)
+        if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
+        uploadBody = await response.blob()
+      } else {
+        const response = await fetch(file.uri)
+        if (!response.ok) throw new Error('Could not read the selected file. Please try again.')
+        uploadBody = await response.blob()
+      }
 
       const { error: uploadError } = await supabase.storage
         .from('song-files')
-        .upload(path, blob, { contentType: file.mimeType ?? 'audio/mpeg' })
+        .upload(path, uploadBody, {
+          contentType: file.mimeType ?? 'audio/mpeg',
+          upsert: false,
+        })
 
-      if (uploadError) throw uploadError
+      if (uploadError) {
+        if (uploadError.message?.includes('Bucket not found')) {
+          throw new Error('Storage is not configured. Please contact support.')
+        }
+        throw new Error(uploadError.message || 'Upload failed. Please try again.')
+      }
 
-      const { data: { publicUrl } } = supabase.storage
+      const { data: signedData, error: signErr } = await supabase.storage
         .from('song-files')
-        .getPublicUrl(path)
+        .createSignedUrl(path, 60 * 60 * 24 * 365) // 1 year
+      if (signErr) throw new Error('File uploaded but failed to generate URL. Please try again.')
+      const fileUrl = signedData.signedUrl
 
       // Save file record
       const { error: fileError } = await supabase.from('song_files').insert({
         song_id: id,
         file_type: fileType,
-        file_url: publicUrl,
+        file_url: fileUrl,
         file_name: file.name,
-        file_size: file.size,
+        file_size: file.size ?? null,
         uploaded_by: profile!.id,
       })
 
-      if (fileError) throw fileError
+      if (fileError) throw new Error('File uploaded but failed to save record. Please try again.')
 
       await fetchSong()
       setSuccessMsg(`${fileType === 'work_tape' ? 'Work tape' : 'Demo'} uploaded!`)
       setTimeout(() => setSuccessMsg(''), 3000)
     } catch (err: any) {
-      setActionError(err.message ?? 'Upload failed')
+      setActionError(err.message ?? 'Upload failed. Please try again.')
     } finally {
       setUploadingType(null)
     }
@@ -376,18 +432,22 @@ export default function SongDetailScreen() {
       setUploadingType('work_tape')
       const songTitle = song?.title?.replace(/[^a-z0-9]/gi, '_').toLowerCase() ?? 'recording'
       const fileName = `${songTitle}_worktape_${Date.now()}.m4a`
-      const path = `${id}/${fileName}`
+      const path = `${song!.artist_id}/${id}/${fileName}`
       const response = await fetch(uri)
+      if (!response.ok) throw new Error('Could not read recording')
       const blob = await response.blob()
       const { error: uploadError } = await supabase.storage
         .from('song-files')
         .upload(path, blob, { contentType: 'audio/m4a' })
-      if (uploadError) throw uploadError
-      const { data: { publicUrl } } = supabase.storage.from('song-files').getPublicUrl(path)
+      if (uploadError) throw new Error(uploadError.message || 'Upload failed')
+      const { data: signedData2, error: signErr2 } = await supabase.storage
+        .from('song-files')
+        .createSignedUrl(path, 60 * 60 * 24 * 365)
+      if (signErr2) throw signErr2
       const { error: fileError } = await supabase.from('song_files').insert({
         song_id: id,
         file_name: fileName,
-        file_url: publicUrl,
+        file_url: signedData2.signedUrl,
         file_type: 'work_tape',
         file_size: blob.size,
         uploaded_by: profile!.id,
@@ -410,14 +470,16 @@ export default function SongDetailScreen() {
   }
 
   const handleSaveLyrics = async () => {
+    if (savingLyrics) return
     setSavingLyrics(true)
-    const { error } = await supabase
-      .from('songs')
-      .update({ lyrics })
-      .eq('id', id)
+    const { error, count } = await withAuthRetry(() =>
+      supabase.from('songs').update({ lyrics }, { count: 'exact' }).eq('id', id)
+    )
     setSavingLyrics(false)
     if (error) {
       setActionError(error.message)
+    } else if (count === 0) {
+      setActionError('You don\'t have permission to edit this song.')
     } else {
       setEditingLyrics(false)
       fetchSong()
@@ -425,13 +487,14 @@ export default function SongDetailScreen() {
   }
 
   const handleSaveDate = async (ymd: string) => {
+    if (savingDate) return
     setSavingDate(true)
-    const { error } = await supabase
-      .from('songs')
-      .update({ date_written: ymd })
-      .eq('id', id)
+    const { error, count } = await withAuthRetry(() =>
+      supabase.from('songs').update({ date_written: ymd }, { count: 'exact' }).eq('id', id)
+    )
     setSavingDate(false)
     if (error) setActionError(error.message)
+    else if (count === 0) setActionError('You don\'t have permission to edit this song.')
     else fetchSong()
   }
 
@@ -631,10 +694,115 @@ export default function SongDetailScreen() {
     setConfirmAction('submit')
   }
 
+  const fetchPlaylists = async () => {
+    const { data } = await supabase
+      .from('playlists')
+      .select('id, name, playlist_songs(count)')
+      .order('created_at', { ascending: false })
+    setPlaylists((data ?? []).map((p: any) => ({
+      id: p.id,
+      name: p.name,
+      song_count: p.playlist_songs?.[0]?.count ?? 0,
+    })))
+  }
+
+  const handleAddToPlaylist = async (playlistId: string) => {
+    if (!song) return
+    setAddingToPlaylist(playlistId)
+    try {
+      // Get current max position
+      const { data: existing } = await supabase
+        .from('playlist_songs')
+        .select('position')
+        .eq('playlist_id', playlistId)
+        .order('position', { ascending: false })
+        .limit(1)
+
+      const nextPosition = (existing?.[0]?.position ?? -1) + 1
+
+      // Pick best file (demo > work tape)
+      const demoFile = song.files?.find(f => f.file_type === 'demo')
+      const wtFile = song.files?.find(f => f.file_type === 'work_tape')
+
+      const { error } = await supabase.from('playlist_songs').insert({
+        playlist_id: playlistId,
+        song_id: song.id,
+        file_id: demoFile?.id ?? wtFile?.id ?? null,
+        position: nextPosition,
+      })
+
+      if (error) {
+        if (error.code === '23505') {
+          setSuccessMsg('Already in that playlist')
+        } else {
+          throw error
+        }
+      } else {
+        setSuccessMsg(`Added to playlist!`)
+      }
+      setTimeout(() => setSuccessMsg(''), 3000)
+      setPlaylistPickerVisible(false)
+    } catch (err: any) {
+      setActionError(err.message ?? 'Failed to add to playlist')
+    } finally {
+      setAddingToPlaylist(null)
+    }
+  }
+
+  const handleShareSong = async () => {
+    if (!song) return
+    try {
+      // Check if share link already exists
+      const { data: existing } = await supabase
+        .from('share_links')
+        .select('slug')
+        .eq('song_id', song.id)
+        .eq('is_active', true)
+        .single()
+
+      let slug = existing?.slug
+      if (!slug) {
+        // Create new share link
+        const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+        slug = ''
+        for (let i = 0; i < 10; i++) slug += chars[Math.floor(Math.random() * chars.length)]
+
+        const demoFile = song.files?.find(f => f.file_type === 'demo')
+        const wtFile = song.files?.find(f => f.file_type === 'work_tape')
+
+        const { error } = await supabase.from('share_links').insert({
+          song_id: song.id,
+          file_id: demoFile?.id ?? wtFile?.id ?? null,
+          created_by: profile!.id,
+          slug,
+        })
+        if (error) throw error
+      }
+
+      const baseUrl = Platform.OS === 'web' && typeof window !== 'undefined'
+        ? window.location.origin
+        : 'https://songvault.app'
+      const url = `${baseUrl}/listen/s/${slug}`
+
+      if (Platform.OS === 'web') {
+        const { setStringAsync } = await import('expo-clipboard')
+        await setStringAsync(url)
+        setSuccessMsg('Share link copied!')
+        setTimeout(() => setSuccessMsg(''), 3000)
+      } else {
+        await Share.share({ message: `Listen to "${song.title}": ${url}`, url })
+      }
+    } catch (err: any) {
+      setActionError(err.message ?? 'Failed to create share link')
+    }
+  }
+
   const handleConfirm = async () => {
     if (confirmAction === 'complete') {
-      await supabase.from('songs').update({ status: 'complete' }).eq('id', id)
+      const { error, count } = await withAuthRetry(() => supabase.from('songs').update({ status: 'complete' }, { count: 'exact' }).eq('id', id))
       setConfirmAction(null)
+      if (error) { setActionError(error.message ?? 'Failed to mark complete'); return }
+      if (count === 0) { setActionError('You don\'t have permission to update this song.'); return }
       fetchSong()
     } else if (confirmAction === 'submit') {
       setSubmitting(true)
@@ -657,15 +825,21 @@ export default function SongDetailScreen() {
       try {
         const wtFile = song?.files?.find((f) => f.file_type === 'work_tape')
         if (wtFile) {
-          // Delete from storage
-          if (wtFile.file_url) {
-            const path = wtFile.file_url.split('/song-files/')[1]
-            if (path) {
-              await supabase.storage.from('song-files').remove([decodeURIComponent(path)])
+          // Delete from storage (best-effort)
+          try {
+            if (wtFile.file_url) {
+              const raw = wtFile.file_url.split('/song-files/')[1]
+              if (raw) {
+                const pathOnly = raw.split('?')[0]
+                await supabase.storage.from('song-files').remove([decodeURIComponent(pathOnly)])
+              }
             }
+          } catch {
+            // Storage cleanup failed — continue with record deletion
           }
           // Delete the file record
-          await supabase.from('song_files').delete().eq('id', wtFile.id)
+          const { error: delErr } = await supabase.from('song_files').delete().eq('id', wtFile.id)
+          if (delErr) throw delErr
           // If song was at work_tape status, revert to logged
           if (song?.status === 'work_tape') {
             await supabase.from('songs').update({ status: 'logged' }).eq('id', id)
@@ -678,24 +852,52 @@ export default function SongDetailScreen() {
         setActionError(err.message ?? 'Failed to delete work tape')
       }
     } else if (confirmAction === 'delete_song') {
+      if (deleting) return
+      setDeleting(true)
       setConfirmAction(null)
       try {
-        // Delete all files from storage
-        const filesToDelete = song?.files?.map((f) => {
-          const path = f.file_url?.split('/song-files/')[1]
-          return path ? decodeURIComponent(path) : null
-        }).filter(Boolean) as string[]
-        if (filesToDelete?.length) {
-          await supabase.storage.from('song-files').remove(filesToDelete)
+        console.log('[delete] Starting delete for song:', id)
+        // Delete all files from storage (best-effort, don't block song deletion)
+        try {
+          const filesToDelete = song?.files?.map((f) => {
+            const raw = f.file_url?.split('/song-files/')[1]
+            if (!raw) return null
+            const pathOnly = raw.split('?')[0]
+            return decodeURIComponent(pathOnly)
+          }).filter(Boolean) as string[]
+          console.log('[delete] Storage files to remove:', filesToDelete)
+          if (filesToDelete?.length) {
+            const storageResult = await supabase.storage.from('song-files').remove(filesToDelete)
+            console.log('[delete] Storage remove result:', storageResult)
+          }
+        } catch (e) {
+          console.warn('[delete] Storage cleanup failed (continuing):', e)
         }
-        // Delete file records, cowriters, then the song itself
-        await supabase.from('song_files').delete().eq('song_id', id)
-        await supabase.from('cowriters').delete().eq('song_id', id)
-        await supabase.from('songs').delete().eq('id', id)
-        // Navigate back
+        // Delete file records
+        console.log('[delete] Deleting song_files...')
+        const { error: fileDelErr } = await supabase.from('song_files').delete().eq('song_id', id)
+        if (fileDelErr) { console.error('[delete] song_files error:', fileDelErr); throw fileDelErr }
+        // Delete cowriters
+        console.log('[delete] Deleting cowriters...')
+        const { error: cwDelErr } = await supabase.from('cowriters').delete().eq('song_id', id)
+        if (cwDelErr) { console.error('[delete] cowriters error:', cwDelErr); throw cwDelErr }
+        // Clean up playlist_songs
+        console.log('[delete] Deleting playlist_songs...')
+        const { error: plDelErr } = await supabase.from('playlist_songs').delete().eq('song_id', id)
+        if (plDelErr) { console.error('[delete] playlist_songs error:', plDelErr); throw plDelErr }
+        // Delete the song itself
+        console.log('[delete] Deleting song...')
+        const { error: songDelErr, count } = await supabase.from('songs').delete({ count: 'exact' }).eq('id', id)
+        if (songDelErr) { console.error('[delete] songs error:', songDelErr); throw songDelErr }
+        if (count === 0) {
+          throw new Error('You don\'t have permission to delete this song. Only the artist or a manager with full access can delete songs.')
+        }
+        console.log('[delete] Success — navigating back')
         router.back()
       } catch (err: any) {
+        console.error('[delete] Failed:', err)
         setActionError(err.message ?? 'Failed to delete song')
+        setDeleting(false)
       }
     }
   }
@@ -735,6 +937,18 @@ export default function SongDetailScreen() {
           </TouchableOpacity>
           <View style={styles.headerRight}>
             <StatusBadge status={song.status} />
+            <TouchableOpacity
+              style={styles.headerShareBtn}
+              onPress={() => setPlaylistPickerVisible(true)}
+            >
+              <Ionicons name="add-circle-outline" size={16} color={Colors.primary} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.headerShareBtn}
+              onPress={handleShareSong}
+            >
+              <Ionicons name="share-outline" size={16} color={Colors.primary} />
+            </TouchableOpacity>
             {!isWriter && song.status !== 'submitted' && (
               <TouchableOpacity
                 style={styles.headerDeleteBtn}
@@ -745,6 +959,26 @@ export default function SongDetailScreen() {
             )}
           </View>
         </View>
+
+        {/* Delete confirmation — shown inline right below header */}
+        {confirmAction === 'delete_song' && (
+          <View style={[styles.confirmCard, { borderColor: Colors.error, marginBottom: Spacing.md }]}>
+            <Text style={styles.confirmText}>
+              {`Delete "${song?.title}"? This will permanently remove the song, all attached files, and cowriter data. This cannot be undone.`}
+            </Text>
+            <View style={styles.confirmButtons}>
+              <TouchableOpacity style={styles.confirmCancel} onPress={() => setConfirmAction(null)}>
+                <Text style={styles.confirmCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.confirmOk, styles.confirmOkDestructive]}
+                onPress={handleConfirm}
+              >
+                <Text style={styles.confirmOkText}>Delete Song</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         <Text style={styles.title}>{song.title}</Text>
 
@@ -1251,19 +1485,14 @@ export default function SongDetailScreen() {
           </View>
         )}
 
-        {/* Inline confirm dialog (not for delete_worktape — that's handled inline in the file row) */}
-        {confirmAction !== null && confirmAction !== 'delete_worktape' && (
-          <View style={[
-            styles.confirmCard,
-            confirmAction === 'delete_song' && { borderColor: Colors.error },
-          ]}>
+        {/* Inline confirm dialog for complete/submit (not delete_worktape or delete_song — those are handled inline) */}
+        {confirmAction !== null && confirmAction !== 'delete_worktape' && confirmAction !== 'delete_song' && (
+          <View style={styles.confirmCard}>
             <Text style={styles.confirmText}>
               {confirmAction === 'complete'
                 ? 'Mark this song as complete and ready for submission?'
                 : confirmAction === 'submit'
                 ? 'Submit to the publisher? This will send an email and cannot be undone.'
-                : confirmAction === 'delete_song'
-                ? `Delete "${song?.title}"? This will permanently remove the song, all attached files, and cowriter data. This cannot be undone.`
                 : ''}
             </Text>
             <View style={styles.confirmButtons}>
@@ -1271,16 +1500,12 @@ export default function SongDetailScreen() {
                 <Text style={styles.confirmCancelText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[
-                  styles.confirmOk,
-                  confirmAction === 'delete_song' && styles.confirmOkDestructive,
-                ]}
+                style={styles.confirmOk}
                 onPress={handleConfirm}
               >
                 <Text style={styles.confirmOkText}>
                   {confirmAction === 'complete' ? 'Mark Complete'
                     : confirmAction === 'submit' ? 'Submit'
-                    : confirmAction === 'delete_song' ? 'Delete Song'
                     : ''}
                 </Text>
               </TouchableOpacity>
@@ -1472,6 +1697,79 @@ export default function SongDetailScreen() {
           </Animated.View>
         </View>
       </Modal>
+
+      {/* ── Add to Playlist Modal ─────────────────────────────────────── */}
+      <Modal
+        visible={playlistPickerVisible}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setPlaylistPickerVisible(false)}
+        onShow={fetchPlaylists}
+      >
+        <SafeAreaView style={styles.container}>
+          <View style={styles.playlistPickerHeader}>
+            <Text style={styles.playlistPickerTitle}>Add to Playlist</Text>
+            <TouchableOpacity onPress={() => setPlaylistPickerVisible(false)}>
+              <Ionicons name="close" size={24} color={Colors.textPrimary} />
+            </TouchableOpacity>
+          </View>
+          <ScrollView contentContainerStyle={{ padding: Spacing.lg, gap: Spacing.sm }}>
+            {playlists.length === 0 ? (
+              <View style={{ alignItems: 'center', paddingVertical: Spacing.xxl, gap: Spacing.sm }}>
+                <Ionicons name="list-outline" size={40} color={Colors.textMuted} />
+                <Text style={{ fontSize: Fonts.sizes.md, fontWeight: '600', color: Colors.textSecondary }}>No playlists yet</Text>
+                <TouchableOpacity
+                  style={styles.playlistCreateBtn}
+                  onPress={() => {
+                    setPlaylistPickerVisible(false)
+                    router.push('/(app)/playlists/new')
+                  }}
+                >
+                  <Ionicons name="add" size={18} color="#fff" />
+                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: Fonts.sizes.sm }}>Create Playlist</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                {playlists.map((pl) => (
+                  <TouchableOpacity
+                    key={pl.id}
+                    style={styles.playlistPickerRow}
+                    onPress={() => handleAddToPlaylist(pl.id)}
+                    disabled={addingToPlaylist !== null}
+                    activeOpacity={0.7}
+                  >
+                    <View style={styles.playlistPickerIcon}>
+                      <Ionicons name="musical-notes" size={18} color={Colors.primary} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.playlistPickerName}>{pl.name}</Text>
+                      <Text style={styles.playlistPickerCount}>
+                        {pl.song_count} song{pl.song_count !== 1 ? 's' : ''}
+                      </Text>
+                    </View>
+                    {addingToPlaylist === pl.id ? (
+                      <ActivityIndicator size="small" color={Colors.primary} />
+                    ) : (
+                      <Ionicons name="add-circle-outline" size={22} color={Colors.primary} />
+                    )}
+                  </TouchableOpacity>
+                ))}
+                <TouchableOpacity
+                  style={styles.playlistPickerNewRow}
+                  onPress={() => {
+                    setPlaylistPickerVisible(false)
+                    router.push('/(app)/playlists/new')
+                  }}
+                >
+                  <Ionicons name="add" size={18} color={Colors.primary} />
+                  <Text style={{ color: Colors.primary, fontWeight: '700', fontSize: Fonts.sizes.sm }}>New Playlist</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   )
 }
@@ -1481,6 +1779,11 @@ const styles = StyleSheet.create({
   scroll: { padding: Spacing.lg, paddingBottom: Spacing.xxl },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: Spacing.md },
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: Spacing.sm },
+  headerShareBtn: {
+    width: 32, height: 32, borderRadius: 16,
+    backgroundColor: `${Colors.primary}12`, borderWidth: 1, borderColor: `${Colors.primary}30`,
+    alignItems: 'center', justifyContent: 'center',
+  },
   headerDeleteBtn: {
     width: 32, height: 32, borderRadius: 16,
     backgroundColor: Colors.surfaceElevated, borderWidth: 1, borderColor: Colors.border,
@@ -1636,6 +1939,42 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm, backgroundColor: Colors.error,
   },
   fileDeleteConfirmText: { fontSize: Fonts.sizes.xs, fontWeight: '700', color: '#fff' },
+
+  // Playlist picker modal
+  playlistPickerHeader: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: Spacing.lg, paddingVertical: Spacing.md,
+    borderBottomWidth: 1, borderBottomColor: Colors.border,
+  },
+  playlistPickerTitle: {
+    fontSize: Fonts.sizes.lg, fontWeight: '800', color: Colors.textPrimary,
+  },
+  playlistCreateBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    backgroundColor: Colors.primary, borderRadius: Radius.full,
+    paddingHorizontal: Spacing.md, paddingVertical: 10,
+  },
+  playlistPickerRow: {
+    flexDirection: 'row', alignItems: 'center', gap: Spacing.md,
+    backgroundColor: Colors.surface, borderRadius: Radius.lg,
+    padding: Spacing.md, borderWidth: 1, borderColor: Colors.border,
+  },
+  playlistPickerIcon: {
+    width: 40, height: 40, borderRadius: Radius.md,
+    backgroundColor: `${Colors.primary}12`,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  playlistPickerName: {
+    fontSize: Fonts.sizes.md, fontWeight: '700', color: Colors.textPrimary,
+  },
+  playlistPickerCount: {
+    fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 2,
+  },
+  playlistPickerNewRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    paddingVertical: Spacing.md, borderRadius: Radius.lg,
+    borderWidth: 1, borderColor: Colors.border, borderStyle: 'dashed',
+  },
 })
 
 const spotifyStyles = StyleSheet.create({
@@ -1673,6 +2012,40 @@ const spotifyStyles = StyleSheet.create({
   resultArtist: { fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 2 },
   noResults: { padding: Spacing.lg, textAlign: 'center', color: Colors.textMuted, fontSize: Fonts.sizes.sm },
   saving: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: Spacing.md },
+  playlistPickerHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingHorizontal: Spacing.lg, paddingVertical: Spacing.md,
+    borderBottomWidth: 1, borderBottomColor: Colors.border,
+  },
+  playlistPickerTitle: {
+    fontSize: Fonts.sizes.lg, fontWeight: '700', color: Colors.textPrimary,
+  },
+  playlistPickerRow: {
+    flexDirection: 'row', alignItems: 'center', gap: Spacing.md,
+    padding: Spacing.md, backgroundColor: Colors.surface,
+    borderRadius: Radius.lg, borderWidth: 1, borderColor: Colors.border,
+  },
+  playlistPickerIcon: {
+    width: 40, height: 40, borderRadius: Radius.md,
+    backgroundColor: `${Colors.primary}12`,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  playlistPickerName: {
+    fontSize: Fonts.sizes.sm, fontWeight: '700', color: Colors.textPrimary,
+  },
+  playlistPickerCount: {
+    fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 1,
+  },
+  playlistPickerNewRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    paddingVertical: Spacing.md, borderRadius: Radius.lg,
+    borderWidth: 1, borderColor: `${Colors.primary}30`, borderStyle: 'dashed',
+  },
+  playlistCreateBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    backgroundColor: Colors.primary, paddingHorizontal: Spacing.lg,
+    paddingVertical: 10, borderRadius: Radius.full, marginTop: Spacing.sm,
+  },
 })
 
 const playerStyles = StyleSheet.create({

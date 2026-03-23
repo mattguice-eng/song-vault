@@ -71,6 +71,27 @@ export default function ArtistDetailScreen() {
   const [sendingInvite, setSendingInvite] = useState(false)
   const [inviteError, setInviteError] = useState('')
 
+  // ── Team ─────────────────────────────────────────────────────────────────
+  interface TeamMember {
+    id: string
+    user_id: string
+    role: string
+    profile?: { full_name: string; email: string; avatar_url: string | null }
+  }
+  interface TeamInvite {
+    id: string
+    email: string
+    role: string
+  }
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([])
+  const [teamInvites, setTeamInvites] = useState<TeamInvite[]>([])
+  const [teamModalVisible, setTeamModalVisible] = useState(false)
+  const [teamEmail, setTeamEmail] = useState('')
+  const [teamRole, setTeamRole] = useState<'manager' | 'admin' | 'viewer'>('manager')
+  const [addingTeamMember, setAddingTeamMember] = useState(false)
+  const [teamError, setTeamError] = useState('')
+  const [removingTeamId, setRemovingTeamId] = useState<string | null>(null)
+
   // ── Calendar ───────────────────────────────────────────────────────────
   const [calendarModalVisible, setCalendarModalVisible] = useState(false)
   const [calendarSyncFrom, setCalendarSyncFrom] = useState(new Date().toISOString().split('T')[0])
@@ -122,7 +143,116 @@ export default function ArtistDetailScreen() {
     setLoading(false)
   }, [id])
 
-  useFocusEffect(useCallback(() => { fetchData() }, [fetchData]))
+  const fetchTeam = async () => {
+    const { data } = await supabase
+      .from('artist_team_members')
+      .select('id, user_id, role')
+      .eq('artist_id', id)
+
+    if (data && data.length > 0) {
+      // Fetch profiles for team members
+      const userIds = data.map(m => m.user_id)
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email, avatar_url')
+        .in('id', userIds)
+
+      const profileMap = new Map((profiles ?? []).map(p => [p.id, p]))
+      setTeamMembers(data.map(m => ({
+        ...m,
+        profile: profileMap.get(m.user_id) as any,
+      })))
+    } else {
+      setTeamMembers([])
+    }
+
+    // Fetch pending invites
+    const { data: invites } = await supabase
+      .from('artist_team_invites')
+      .select('id, email, role')
+      .eq('artist_id', id)
+      .eq('accepted', false)
+    setTeamInvites((invites ?? []) as TeamInvite[])
+  }
+
+  useFocusEffect(useCallback(() => {
+    fetchData()
+    fetchTeam()
+  }, [fetchData]))
+
+  const isOwner = artist?.manager_id === profile?.id
+
+  const handleAddTeamMember = async () => {
+    if (!teamEmail.trim() || !teamEmail.includes('@')) {
+      setTeamError('Enter a valid email address.')
+      return
+    }
+    setTeamError('')
+    setAddingTeamMember(true)
+
+    try {
+      const email = teamEmail.trim().toLowerCase()
+
+      // Call edge function to handle invite (sends email if new user, adds directly if existing)
+      const session = (await supabase.auth.getSession()).data.session
+      console.log('[team] calling invite function, has session:', !!session)
+      const res = await fetch(
+        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/invite-team-member`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!,
+            'Authorization': `Bearer ${session?.access_token}`,
+          },
+          body: JSON.stringify({
+            artist_id: id,
+            email,
+            role: teamRole,
+            artist_name: artist?.stage_name ?? '',
+            inviter_name: profile?.full_name ?? '',
+          }),
+        }
+      )
+
+      console.log('[team] response status:', res.status)
+      const resultText = await res.text()
+      console.log('[team] response body:', resultText)
+
+      let result: any
+      try { result = JSON.parse(resultText) } catch { result = { error: resultText } }
+
+      if (!res.ok || result.error) {
+        throw new Error(result.error ?? 'Failed to send invite')
+      }
+
+      setTeamEmail('')
+      if (result.existing) {
+        setSuccessMsg(`Added to team!`)
+      } else {
+        setSuccessMsg(`Invite email sent to ${email}!`)
+      }
+      setTimeout(() => setSuccessMsg(''), 4000)
+      fetchTeam()
+      setTeamModalVisible(false)
+    } catch (err: any) {
+      setTeamError(err.message ?? 'Failed to add team member.')
+    } finally {
+      setAddingTeamMember(false)
+    }
+  }
+
+  const handleRemoveTeamMember = async (memberId: string) => {
+    setRemovingTeamId(memberId)
+    try {
+      await supabase.from('artist_team_members').delete().eq('id', memberId)
+      setTeamMembers(prev => prev.filter(m => m.id !== memberId))
+    } catch (err) {
+      console.error('[artist-detail] remove team member error:', err)
+    } finally {
+      setRemovingTeamId(null)
+    }
+  }
 
   // ── Invite ────────────────────────────────────────────────────────────────
   const handleSendInvite = async () => {
@@ -443,9 +573,12 @@ export default function ArtistDetailScreen() {
 
       if (uploadError) throw uploadError
 
-      const { data: { publicUrl } } = supabase.storage.from('song-files').getPublicUrl(path)
+      const { data: signedData, error: signErr } = await supabase.storage
+        .from('song-files')
+        .createSignedUrl(path, 60 * 60 * 24 * 365) // 1 year
+      if (signErr) throw signErr
 
-      await supabase.from('artists').update({ avatar_url: publicUrl }).eq('id', id)
+      await supabase.from('artists').update({ avatar_url: signedData.signedUrl }).eq('id', id)
       fetchData()
     } catch (err: any) {
       setPhotoError(err.message ?? 'Upload failed')
@@ -876,7 +1009,159 @@ export default function ArtistDetailScreen() {
             <Ionicons name="chevron-forward" size={16} color={Colors.textMuted} />
           </TouchableOpacity>
         </View>
+
+        {/* ── Team ─────────────────────────────────────────────── */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Team</Text>
+            {isOwner && (
+              <TouchableOpacity
+                style={styles.addBtn}
+                onPress={() => { setTeamModalVisible(true); setTeamError(''); setTeamEmail('') }}
+              >
+                <Ionicons name="person-add-outline" size={14} color="#fff" />
+                <Text style={styles.addBtnText}>Add</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {/* Owner */}
+          <View style={styles.teamRow}>
+            <View style={styles.teamAvatar}>
+              <Ionicons name="shield" size={16} color={Colors.primary} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.teamName}>{profile?.full_name ?? profile?.email ?? 'Owner'}</Text>
+              <Text style={styles.teamRole}>Owner</Text>
+            </View>
+          </View>
+
+          {/* Team members */}
+          {teamMembers.map(member => (
+            <View key={member.id} style={styles.teamRow}>
+              <View style={[styles.teamAvatar, { backgroundColor: `${Colors.primary}20` }]}>
+                <Ionicons name="person" size={16} color={Colors.primary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.teamName}>
+                  {member.profile?.full_name || member.profile?.email || 'Unknown'}
+                </Text>
+                <Text style={styles.teamRole}>
+                  {member.role === 'admin' ? 'Admin' : member.role === 'viewer' ? 'Viewer' : 'Manager'}
+                </Text>
+              </View>
+              {isOwner && (
+                <TouchableOpacity
+                  onPress={() => handleRemoveTeamMember(member.id)}
+                  disabled={removingTeamId === member.id}
+                >
+                  {removingTeamId === member.id ? (
+                    <ActivityIndicator size="small" color={Colors.textMuted} />
+                  ) : (
+                    <Ionicons name="close-circle-outline" size={20} color={Colors.textMuted} />
+                  )}
+                </TouchableOpacity>
+              )}
+            </View>
+          ))}
+
+          {/* Pending invites */}
+          {teamInvites.map(invite => (
+            <View key={invite.id} style={styles.teamRow}>
+              <View style={[styles.teamAvatar, { backgroundColor: `${Colors.warning ?? '#F59E0B'}20` }]}>
+                <Ionicons name="mail-outline" size={16} color={Colors.warning ?? '#F59E0B'} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.teamName}>{invite.email}</Text>
+                <Text style={[styles.teamRole, { color: Colors.warning ?? '#F59E0B' }]}>
+                  Pending · {invite.role === 'admin' ? 'Admin' : invite.role === 'viewer' ? 'Viewer' : 'Manager'}
+                </Text>
+              </View>
+              {isOwner && (
+                <TouchableOpacity onPress={async () => {
+                  await supabase.from('artist_team_invites').delete().eq('id', invite.id)
+                  setTeamInvites(prev => prev.filter(i => i.id !== invite.id))
+                }}>
+                  <Ionicons name="close-circle-outline" size={20} color={Colors.textMuted} />
+                </TouchableOpacity>
+              )}
+            </View>
+          ))}
+
+          {teamMembers.length === 0 && teamInvites.length === 0 && (
+            <Text style={styles.teamEmpty}>
+              No team members yet. Add managers or admins to collaborate.
+            </Text>
+          )}
+        </View>
       </ScrollView>
+
+      {/* ── Add Team Member Modal ─── */}
+      <Modal visible={teamModalVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setTeamModalVisible(false)}>
+        <SafeAreaView style={styles.modalSafe}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Add Team Member</Text>
+            <TouchableOpacity onPress={() => setTeamModalVisible(false)}>
+              <Ionicons name="close" size={24} color={Colors.textPrimary} />
+            </TouchableOpacity>
+          </View>
+          <View style={{ padding: Spacing.lg, gap: Spacing.md }}>
+            <Text style={{ fontSize: Fonts.sizes.sm, color: Colors.textSecondary, lineHeight: 20 }}>
+              Add someone to this artist's team. They'll be able to view and manage songs, playlists, and deals.
+            </Text>
+            <Input
+              label="Email Address"
+              value={teamEmail}
+              onChangeText={setTeamEmail}
+              placeholder="team@example.com"
+              autoCapitalize="none"
+              keyboardType="email-address"
+            />
+
+            {/* Role picker */}
+            <View>
+              <Text style={{ fontSize: Fonts.sizes.xs, fontWeight: '700', color: Colors.textMuted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+                Role
+              </Text>
+              <View style={{ flexDirection: 'row', gap: Spacing.sm }}>
+                {(['manager', 'admin', 'viewer'] as const).map(r => (
+                  <TouchableOpacity
+                    key={r}
+                    style={[
+                      styles.roleChip,
+                      teamRole === r && styles.roleChipActive,
+                    ]}
+                    onPress={() => setTeamRole(r)}
+                  >
+                    <Text style={[
+                      styles.roleChipText,
+                      teamRole === r && styles.roleChipTextActive,
+                    ]}>
+                      {r === 'manager' ? 'Manager' : r === 'admin' ? 'Admin' : 'Viewer'}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <Text style={{ fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 6 }}>
+                {teamRole === 'manager' ? 'Can view and manage songs, playlists, and deals.' :
+                 teamRole === 'admin' ? 'Full access including adding/removing team members.' :
+                 'Read-only access to songs and playlists.'}
+              </Text>
+            </View>
+
+            {teamError ? (
+              <Text style={{ color: Colors.error, fontSize: Fonts.sizes.sm }}>{teamError}</Text>
+            ) : null}
+
+            <Button
+              title="Add to Team"
+              onPress={handleAddTeamMember}
+              loading={addingTeamMember}
+              disabled={!teamEmail.trim()}
+            />
+          </View>
+        </SafeAreaView>
+      </Modal>
 
       {/* Photo Action Sheet */}
       <Modal visible={photoActionVisible} animationType="fade" transparent>
@@ -1788,4 +2073,49 @@ const styles = StyleSheet.create({
   },
   noPublishersText: { color: Colors.textMuted, fontSize: Fonts.sizes.sm },
   errorText: { color: Colors.error, fontSize: Fonts.sizes.xs, marginBottom: Spacing.sm },
+
+  // Team
+  addBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: Colors.primary, borderRadius: Radius.full,
+    paddingHorizontal: 12, paddingVertical: 6,
+  },
+  addBtnText: {
+    color: '#fff', fontWeight: '700', fontSize: Fonts.sizes.xs,
+  },
+  teamRow: {
+    flexDirection: 'row', alignItems: 'center', gap: Spacing.sm,
+    paddingVertical: 10,
+    borderBottomWidth: 1, borderBottomColor: Colors.border,
+  },
+  teamAvatar: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: `${Colors.primary}12`,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  teamName: {
+    fontSize: Fonts.sizes.sm, fontWeight: '600', color: Colors.textPrimary,
+  },
+  teamRole: {
+    fontSize: Fonts.sizes.xs, color: Colors.textMuted, marginTop: 1,
+    textTransform: 'capitalize',
+  },
+  teamEmpty: {
+    fontSize: Fonts.sizes.sm, color: Colors.textMuted,
+    paddingVertical: Spacing.md, textAlign: 'center',
+  },
+  roleChip: {
+    flex: 1, paddingVertical: 10,
+    borderRadius: Radius.md, borderWidth: 1, borderColor: Colors.border,
+    alignItems: 'center',
+  },
+  roleChipActive: {
+    backgroundColor: `${Colors.primary}15`, borderColor: Colors.primary,
+  },
+  roleChipText: {
+    fontSize: Fonts.sizes.sm, fontWeight: '600', color: Colors.textMuted,
+  },
+  roleChipTextActive: {
+    color: Colors.primary,
+  },
 })

@@ -256,8 +256,8 @@ create policy "Artists can manage own songs" on public.songs
       where a.id = artist_id and a.user_id = auth.uid()
     )
   );
-create policy "Managers can view all artist songs" on public.songs
-  for select using (
+create policy "Managers can manage all artist songs" on public.songs
+  for all using (
     exists (
       select 1 from public.artists a
       where a.id = artist_id and a.manager_id = auth.uid()

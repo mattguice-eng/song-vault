@@ -297,12 +297,13 @@ export default function ImportScreen() {
         if (songErr) throw songErr
 
         // Insert artist as first co-writer with their share
-        await supabase.from('cowriters').insert({
+        const { error: artistCwErr } = await supabase.from('cowriters').insert({
           song_id: songData.id,
           name: artistDisplayName,
           split_percentage: parseFloat(row.artistSplit) || 0,
           songwriter_id: artistSwId,
         })
+        if (artistCwErr) throw artistCwErr
 
         // Insert remaining co-writers
         for (const cw of row.cowriters) {
@@ -314,12 +315,13 @@ export default function ImportScreen() {
               .from('songwriters').insert({ name: cw.name }).select('id').single()
             swId = newSw?.id ?? null
           }
-          await supabase.from('cowriters').insert({
+          const { error: cwErr } = await supabase.from('cowriters').insert({
             song_id: songData.id,
             name: cw.name,
             split_percentage: parseFloat(cw.split),
             songwriter_id: swId,
           })
+          if (cwErr) throw cwErr
         }
 
         updated[i] = { ...updated[i], importStatus: 'done' }

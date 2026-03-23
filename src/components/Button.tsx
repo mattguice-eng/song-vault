@@ -64,7 +64,7 @@ export const Button: React.FC<ButtonProps> = ({
 const styles = StyleSheet.create({
   base: {
     height: 52,
-    borderRadius: Radius.md,
+    borderRadius: Radius.full,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: Spacing.lg,

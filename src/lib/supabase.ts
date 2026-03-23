@@ -37,3 +37,26 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     detectSessionInUrl: Platform.OS === 'web',
   },
 })
+
+/**
+ * Retry a Supabase operation once if it fails with an auth error (JWT expired).
+ * This handles the edge case where auto-refresh hasn't completed yet.
+ */
+export async function withAuthRetry<T>(
+  operation: () => Promise<{ data: T; error: any }>
+): Promise<{ data: T; error: any }> {
+  const result = await operation()
+  if (result.error && (
+    result.error.message?.includes('JWT') ||
+    result.error.message?.includes('token') ||
+    result.error.code === 'PGRST301' ||
+    result.error.status === 401
+  )) {
+    // Try refreshing the session and retry once
+    const { error: refreshError } = await supabase.auth.refreshSession()
+    if (!refreshError) {
+      return operation()
+    }
+  }
+  return result
+}
