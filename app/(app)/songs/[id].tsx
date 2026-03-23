@@ -392,14 +392,14 @@ export default function SongDetailScreen() {
       const fileUrl = signedData.signedUrl
 
       // Save file record
-      const { error: fileError } = await supabase.from('song_files').insert({
+      const { error: fileError } = await withAuthRetry(() => supabase.from('song_files').insert({
         song_id: id,
         file_type: fileType,
         file_url: fileUrl,
         file_name: file.name,
         file_size: file.size ?? null,
         uploaded_by: profile!.id,
-      })
+      }))
 
       if (fileError) throw new Error('File uploaded but failed to save record. Please try again.')
 
@@ -821,10 +821,10 @@ export default function SongDetailScreen() {
       setSubmitting(true)
       setConfirmAction(null)
       try {
-        await supabase
+        await withAuthRetry(() => supabase
           .from('songs')
           .update({ status: 'submitted', submitted_at: new Date().toISOString() })
-          .eq('id', id)
+          .eq('id', id))
         await sendSubmissionEmail(song!)
         await fetchSong()
         setSuccessMsg('Submitted! The publisher has been notified and your manager is CC\'d.')
@@ -851,11 +851,11 @@ export default function SongDetailScreen() {
             // Storage cleanup failed — continue with record deletion
           }
           // Delete the file record
-          const { error: delErr } = await supabase.from('song_files').delete().eq('id', wtFile.id)
+          const { error: delErr } = await withAuthRetry(() => supabase.from('song_files').delete().eq('id', wtFile.id))
           if (delErr) throw delErr
           // If song was at work_tape status, revert to logged
           if (song?.status === 'work_tape') {
-            await supabase.from('songs').update({ status: 'logged' }).eq('id', id)
+            await withAuthRetry(() => supabase.from('songs').update({ status: 'logged' }).eq('id', id))
           }
           await fetchSong()
           setSuccessMsg('Work tape deleted')
@@ -870,6 +870,15 @@ export default function SongDetailScreen() {
       setConfirmAction(null)
       try {
         console.log('[delete] Starting delete for song:', id)
+
+        // Proactively refresh session before delete to avoid expired JWT mid-flow
+        try {
+          await supabase.auth.refreshSession()
+          console.log('[delete] Session refreshed before delete')
+        } catch {
+          console.warn('[delete] Pre-delete session refresh failed, continuing anyway')
+        }
+
         // Delete all files from storage (best-effort, don't block song deletion)
         try {
           const filesToDelete = song?.files?.map((f) => {
@@ -888,19 +897,19 @@ export default function SongDetailScreen() {
         }
         // Delete file records
         console.log('[delete] Deleting song_files...')
-        const { error: fileDelErr } = await supabase.from('song_files').delete().eq('song_id', id)
+        const { error: fileDelErr } = await withAuthRetry(() => supabase.from('song_files').delete().eq('song_id', id))
         if (fileDelErr) { console.error('[delete] song_files error:', fileDelErr); throw fileDelErr }
         // Delete cowriters
         console.log('[delete] Deleting cowriters...')
-        const { error: cwDelErr } = await supabase.from('cowriters').delete().eq('song_id', id)
+        const { error: cwDelErr } = await withAuthRetry(() => supabase.from('cowriters').delete().eq('song_id', id))
         if (cwDelErr) { console.error('[delete] cowriters error:', cwDelErr); throw cwDelErr }
         // Clean up playlist_songs
         console.log('[delete] Deleting playlist_songs...')
-        const { error: plDelErr } = await supabase.from('playlist_songs').delete().eq('song_id', id)
+        const { error: plDelErr } = await withAuthRetry(() => supabase.from('playlist_songs').delete().eq('song_id', id))
         if (plDelErr) { console.error('[delete] playlist_songs error:', plDelErr); throw plDelErr }
         // Delete the song itself
         console.log('[delete] Deleting song...')
-        const { error: songDelErr, count } = await supabase.from('songs').delete({ count: 'exact' }).eq('id', id)
+        const { error: songDelErr, count } = await withAuthRetry(() => supabase.from('songs').delete({ count: 'exact' }).eq('id', id))
         if (songDelErr) { console.error('[delete] songs error:', songDelErr); throw songDelErr }
         if (count === 0) {
           throw new Error('You don\'t have permission to delete this song. Only the artist or a manager with full access can delete songs.')
