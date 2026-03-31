@@ -123,6 +123,7 @@ export default function AppLayout() {
       <Tabs.Screen name="songs/new" options={{ href: null, tabBarStyle: { display: 'none' } }} />
       <Tabs.Screen name="songs/[id]" options={{ href: null, tabBarStyle: { display: 'none' } }} />
       <Tabs.Screen name="songs/import" options={{ href: null, tabBarStyle: { display: 'none' } }} />
+      <Tabs.Screen name="songs/export" options={{ href: null, tabBarStyle: { display: 'none' } }} />
       <Tabs.Screen name="artists/[id]" options={{ href: null, tabBarStyle: { display: 'none' } }} />
       <Tabs.Screen name="writers/[id]" options={{ href: null, tabBarStyle: { display: 'none' } }} />
       <Tabs.Screen name="playlists/[id]" options={{ href: null, tabBarStyle: { display: 'none' } }} />

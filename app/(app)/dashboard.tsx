@@ -810,13 +810,22 @@ export default function DashboardScreen() {
                 </View>
               </View>
             </View>
-            <TouchableOpacity
-              style={styles.newSongButton}
-              onPress={() => router.push('/(app)/songs/new')}
-            >
-              <Ionicons name="add" size={20} color="#fff" />
-              <Text style={styles.newSongText}>New Song</Text>
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TouchableOpacity
+                style={[styles.newSongButton, { backgroundColor: Colors.primary }]}
+                onPress={() => router.push('/(app)/songs/export')}
+              >
+                <Ionicons name="paper-plane-outline" size={18} color="#fff" />
+                <Text style={styles.newSongText}>Export</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.newSongButton}
+                onPress={() => router.push('/(app)/songs/new')}
+              >
+                <Ionicons name="add" size={20} color="#fff" />
+                <Text style={styles.newSongText}>New Song</Text>
+              </TouchableOpacity>
+            </View>
           </View>
 
           {/* Stats */}

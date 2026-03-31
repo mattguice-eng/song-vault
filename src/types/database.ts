@@ -311,6 +311,26 @@ export type Database = {
   }
 }
 
+export interface Submission {
+  id: string
+  artist_id: string
+  publisher_id: string | null
+  publisher_name: string
+  submitted_by: string
+  song_count: number
+  demo_count: number
+  notes: string | null
+  created_at: string
+}
+
+export interface SubmissionSong {
+  id: string
+  submission_id: string
+  song_id: string
+  had_demo: boolean
+  created_at: string
+}
+
 // ─── Joined / computed types used in the UI ───────────────────────────────────
 
 export interface SongWithDetails extends Song {
