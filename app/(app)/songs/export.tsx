@@ -44,12 +44,13 @@ export default function ExportScreen() {
   }, [])
 
   const fetchSongs = async () => {
-    if (!profile) return
+    if (!profile) { setLoading(false); return }
+    if (isManager && !activeArtist) { setLoading(false); return }
     try {
       let query = supabase
         .from('songs')
         .select('*, cowriters(*), files:song_files(*), artist:artists(id, stage_name, real_name)')
-        .in('status', ['complete']) // only complete songs
+        .in('status', ['logged', 'complete']) // logged and complete songs eligible for export
         .order('date_written', { ascending: false })
 
       if (isManager && activeArtist) {
@@ -134,8 +135,10 @@ export default function ExportScreen() {
     setExportSuccess('')
 
     try {
+      console.log('[export] Starting export for', selectedSongs.length, 'songs')
       // Dynamic import JSZip (only needed on export)
       const JSZip = (await import('jszip')).default
+      console.log('[export] JSZip loaded')
       const zip = new JSZip()
 
       const publisherName = selectedPublisher?.name ?? 'Publisher'
@@ -157,6 +160,7 @@ export default function ExportScreen() {
       })
       const csvContent = [csvHeaders.join(','), ...csvRows].join('\n')
       zip.file(`${folderName}/songs_export.csv`, csvContent)
+      console.log('[export] CSV generated')
 
       // ── 2. Generate lyrics files ─────────────────────────────────────
       const lyricsFolder = zip.folder(`${folderName}/lyrics`)!
@@ -206,7 +210,9 @@ export default function ExportScreen() {
       }
 
       // ── 4. Generate zip and trigger download ─────────────────────────
+      console.log('[export] Generating zip...')
       const zipBlob = await zip.generateAsync({ type: 'blob' })
+      console.log('[export] Zip generated, size:', zipBlob.size)
 
       if (Platform.OS === 'web') {
         const url = URL.createObjectURL(zipBlob)
@@ -219,32 +225,50 @@ export default function ExportScreen() {
         URL.revokeObjectURL(url)
       }
 
-      // ── 5. Mark songs as submitted ───────────────────────────────────
-      const now = new Date().toISOString()
-      for (const song of selectedSongs) {
-        await supabase.from('songs').update({
-          status: 'submitted',
-          submitted_at: now,
-        }).eq('id', song.id)
+      console.log('[export] Download triggered')
+
+      // ── 5. Mark songs as submitted (best-effort) ────────────────────
+      try {
+        const now = new Date().toISOString()
+        for (const song of selectedSongs) {
+          const { error } = await supabase.from('songs').update({
+            status: 'submitted',
+            submitted_at: now,
+          }).eq('id', song.id)
+          if (error) console.warn('[export] Failed to mark song submitted:', song.title, error)
+        }
+        console.log('[export] Songs marked as submitted')
+      } catch (e) {
+        console.warn('[export] Failed to update song statuses:', e)
       }
 
-      // ── 6. Save submission record ────────────────────────────────────
-      const { data: submissionData } = await supabase.from('submissions').insert({
-        artist_id: isManager ? activeArtist!.id : (songs[0] as any)?.artist_id,
-        publisher_id: selectedPublisherId,
-        publisher_name: selectedPublisher?.name ?? 'Unknown',
-        submitted_by: profile!.id,
-        song_count: selectedSongs.length,
-        demo_count: demoCount,
-      }).select('id').single()
+      // ── 6. Save submission record (best-effort) ─────────────────────
+      try {
+        const songArtistId = isManager ? activeArtist?.id : (songs[0] as any)?.artist_id
+        if (songArtistId) {
+          const { data: submissionData, error: subErr } = await supabase.from('submissions').insert({
+            artist_id: songArtistId,
+            publisher_id: selectedPublisherId,
+            publisher_name: selectedPublisher?.name ?? 'Unknown',
+            submitted_by: profile!.id,
+            song_count: selectedSongs.length,
+            demo_count: demoCount,
+          }).select('id').single()
 
-      if (submissionData) {
-        const submissionSongs = selectedSongs.map(song => ({
-          submission_id: submissionData.id,
-          song_id: song.id,
-          had_demo: song.hasDemo,
-        }))
-        await supabase.from('submission_songs').insert(submissionSongs)
+          if (subErr) {
+            console.warn('[export] Submission record failed:', subErr)
+          } else if (submissionData) {
+            const submissionSongs = selectedSongs.map(song => ({
+              submission_id: submissionData.id,
+              song_id: song.id,
+              had_demo: song.hasDemo,
+            }))
+            await supabase.from('submission_songs').insert(submissionSongs)
+            console.log('[export] Submission record saved')
+          }
+        }
+      } catch (e) {
+        console.warn('[export] Failed to save submission record:', e)
       }
 
       setExportSuccess(`Exported ${selectedSongs.length} songs (${demoCount} demos). Songs marked as submitted.`)
@@ -274,7 +298,7 @@ export default function ExportScreen() {
         {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
-            <Ionicons name="arrow-back" size={24} color={Colors.text} />
+            <Ionicons name="arrow-back" size={24} color={Colors.textPrimary} />
           </TouchableOpacity>
           <View style={{ flex: 1 }}>
             <Text style={styles.title}>Export for Publisher</Text>
@@ -292,7 +316,7 @@ export default function ExportScreen() {
             <Text style={styles.publisherValue}>
               {selectedPublisher?.name ?? 'Select publisher...'}
             </Text>
-            <Ionicons name="chevron-down" size={18} color={Colors.textMuted} />
+            <Ionicons name="chevron-down" size={18} color={Colors.textPrimaryMuted} />
           </TouchableOpacity>
         )}
 
@@ -343,7 +367,7 @@ export default function ExportScreen() {
         {/* Song list */}
         {visibleSongs.length === 0 ? (
           <View style={styles.emptyState}>
-            <Ionicons name="document-outline" size={48} color={Colors.textMuted} />
+            <Ionicons name="document-outline" size={48} color={Colors.textPrimaryMuted} />
             <Text style={styles.emptyText}>No complete songs ready for export</Text>
             <Text style={styles.emptySubtext}>Mark songs as "Complete" to include them here</Text>
           </View>
@@ -357,7 +381,7 @@ export default function ExportScreen() {
               <Ionicons
                 name={song.selected ? 'checkbox' : 'square-outline'}
                 size={22}
-                color={song.selected ? Colors.primary : Colors.textMuted}
+                color={song.selected ? Colors.primary : Colors.textPrimaryMuted}
               />
               <View style={styles.songInfo}>
                 <Text style={styles.songTitle}>{song.title}</Text>
@@ -463,8 +487,8 @@ const styles = StyleSheet.create({
   content: { padding: Spacing.md },
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: Spacing.lg },
   backBtn: { marginRight: Spacing.sm, padding: 4 },
-  title: { fontSize: 22, fontWeight: '700', color: Colors.text },
-  subtitle: { fontSize: 14, color: Colors.textMuted, marginTop: 2 },
+  title: { fontSize: 22, fontWeight: '700', color: Colors.textPrimary },
+  subtitle: { fontSize: 14, color: Colors.textPrimaryMuted, marginTop: 2 },
 
   publisherPicker: {
     flexDirection: 'row', alignItems: 'center',
@@ -472,8 +496,8 @@ const styles = StyleSheet.create({
     padding: Spacing.md, marginBottom: Spacing.md,
     borderWidth: 1, borderColor: Colors.border,
   },
-  publisherLabel: { fontSize: 14, color: Colors.textMuted, marginRight: 8 },
-  publisherValue: { flex: 1, fontSize: 15, color: Colors.text, fontWeight: '600' },
+  publisherLabel: { fontSize: 14, color: Colors.textPrimaryMuted, marginRight: 8 },
+  publisherValue: { flex: 1, fontSize: 15, color: Colors.textPrimary, fontWeight: '600' },
 
   toggleRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
@@ -481,7 +505,7 @@ const styles = StyleSheet.create({
     padding: Spacing.md, marginBottom: Spacing.md,
     borderWidth: 1, borderColor: Colors.border,
   },
-  toggleLabel: { fontSize: 14, color: Colors.text },
+  toggleLabel: { fontSize: 14, color: Colors.textPrimary },
 
   summaryBar: {
     flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap',
@@ -489,7 +513,7 @@ const styles = StyleSheet.create({
     padding: Spacing.sm, paddingHorizontal: Spacing.md, marginBottom: Spacing.sm,
     gap: 10,
   },
-  summaryText: { fontSize: 14, fontWeight: '600', color: Colors.text },
+  summaryText: { fontSize: 14, fontWeight: '600', color: Colors.textPrimary },
   summaryDemo: { fontSize: 13, color: Colors.primary },
   warningBadge: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   warningText: { fontSize: 12, color: '#F59E0B', fontWeight: '500' },
@@ -498,7 +522,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: 10,
     paddingVertical: Spacing.sm, marginBottom: 4,
   },
-  selectAllText: { fontSize: 14, color: Colors.text, fontWeight: '600' },
+  selectAllText: { fontSize: 14, color: Colors.textPrimary, fontWeight: '600' },
 
   songRow: {
     flexDirection: 'row', alignItems: 'center',
@@ -508,8 +532,8 @@ const styles = StyleSheet.create({
   },
   songRowSelected: { borderColor: Colors.primary, borderWidth: 1.5 },
   songInfo: { flex: 1, marginLeft: 12 },
-  songTitle: { fontSize: 15, fontWeight: '600', color: Colors.text },
-  songMeta: { fontSize: 12, color: Colors.textMuted, marginTop: 2 },
+  songTitle: { fontSize: 15, fontWeight: '600', color: Colors.textPrimary },
+  songMeta: { fontSize: 12, color: Colors.textPrimaryMuted, marginTop: 2 },
   songBadges: { flexDirection: 'row', gap: 6 },
   badge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   badgeGreen: { backgroundColor: '#059669' },
@@ -519,8 +543,8 @@ const styles = StyleSheet.create({
   badgeTextDark: { fontSize: 11, fontWeight: '600', color: '#1a1a1a' },
 
   emptyState: { alignItems: 'center', paddingVertical: 40 },
-  emptyText: { fontSize: 16, color: Colors.textMuted, marginTop: 12 },
-  emptySubtext: { fontSize: 13, color: Colors.textMuted, marginTop: 4 },
+  emptyText: { fontSize: 16, color: Colors.textPrimaryMuted, marginTop: 12 },
+  emptySubtext: { fontSize: 13, color: Colors.textPrimaryMuted, marginTop: 4 },
 
   errorBanner: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
@@ -551,12 +575,12 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.surface, borderRadius: Radius.lg,
     padding: Spacing.lg, width: '85%', maxWidth: 400,
   },
-  modalTitle: { fontSize: 18, fontWeight: '700', color: Colors.text, marginBottom: Spacing.md },
+  modalTitle: { fontSize: 18, fontWeight: '700', color: Colors.textPrimary, marginBottom: Spacing.md },
   modalOption: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     padding: Spacing.md, borderRadius: Radius.sm,
     marginBottom: 4,
   },
   modalOptionSelected: { backgroundColor: Colors.background },
-  modalOptionText: { fontSize: 15, color: Colors.text },
+  modalOptionText: { fontSize: 15, color: Colors.textPrimary },
 })
