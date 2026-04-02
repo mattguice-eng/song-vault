@@ -183,31 +183,52 @@ export default function ExportScreen() {
       // ── 3. Download and package demo files ───────────────────────────
       const demosFolder = zip.folder(`${folderName}/demos`)!
       let demoCount = 0
-      for (const song of selectedSongs) {
-        if (!song.demoFile) continue
+      const songsWithDemos = selectedSongs.filter(s => s.demoFile)
+      console.log('[export] Downloading', songsWithDemos.length, 'demo files...')
+      for (let i = 0; i < songsWithDemos.length; i++) {
+        const song = songsWithDemos[i]
         try {
+          console.log(`[export] Demo ${i + 1}/${songsWithDemos.length}: ${song.title}`)
           // Get a fresh signed URL for download
-          const raw = song.demoFile.file_url.split('/song-files/')[1]
-          if (!raw) continue
+          const raw = song.demoFile!.file_url.split('/song-files/')[1]
+          if (!raw) { console.warn('[export] No storage path for:', song.title); continue }
           const storagePath = decodeURIComponent(raw.split('?')[0])
           const { data: signedData, error: signErr } = await supabase.storage
             .from('song-files')
             .createSignedUrl(storagePath, 300) // 5 min
-          if (signErr || !signedData?.signedUrl) continue
+          if (signErr || !signedData?.signedUrl) {
+            console.warn('[export] Signed URL failed for:', song.title, signErr)
+            continue
+          }
 
-          const response = await fetch(signedData.signedUrl)
-          if (!response.ok) continue
-          const blob = await response.blob()
+          // Fetch with timeout so a single bad file doesn't hang the whole export
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 30000) // 30s per file
+          try {
+            const response = await fetch(signedData.signedUrl, { signal: controller.signal })
+            clearTimeout(timeout)
+            if (!response.ok) { console.warn('[export] Fetch failed for:', song.title, response.status); continue }
+            const blob = await response.blob()
 
-          // Name: SongTitle_Date_WriterName.ext
-          const ext = song.demoFile.file_name?.split('.').pop() ?? 'mp3'
-          const demoFileName = `${sanitizeFilename(song.title)}_${song.date_written ?? 'nodate'}_${sanitizeFilename(artistName)}.${ext}`
-          demosFolder.file(demoFileName, blob)
-          demoCount++
+            // Name: SongTitle_Date_WriterName.ext
+            const ext = song.demoFile!.file_name?.split('.').pop() ?? 'mp3'
+            const demoFileName = `${sanitizeFilename(song.title)}_${song.date_written ?? 'nodate'}_${sanitizeFilename(artistName)}.${ext}`
+            demosFolder.file(demoFileName, blob)
+            demoCount++
+            console.log(`[export] Demo ${i + 1} done (${(blob.size / 1024 / 1024).toFixed(1)}MB)`)
+          } catch (fetchErr: any) {
+            clearTimeout(timeout)
+            if (fetchErr.name === 'AbortError') {
+              console.warn('[export] Demo download timed out for:', song.title)
+            } else {
+              console.warn('[export] Demo fetch error for:', song.title, fetchErr)
+            }
+          }
         } catch (e) {
           console.warn('[export] Failed to download demo for:', song.title, e)
         }
       }
+      console.log('[export] Demo downloads complete:', demoCount, 'of', songsWithDemos.length)
 
       // ── 4. Generate zip and trigger download ─────────────────────────
       console.log('[export] Generating zip...')
