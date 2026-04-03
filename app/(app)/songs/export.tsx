@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
-  ActivityIndicator, Switch, Modal,
+  ActivityIndicator, Switch,
 } from 'react-native'
 import { router } from 'expo-router'
 import { Platform } from 'react-native'
@@ -9,7 +9,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { supabase } from '../../../src/lib/supabase'
 import { useAuthStore } from '../../../src/store/authStore'
-import { SongWithDetails, Publisher } from '../../../src/types/database'
+import { SongWithDetails } from '../../../src/types/database'
 import { Colors, Spacing, Fonts, Radius } from '../../../src/utils/constants'
 
 interface ExportSong extends SongWithDetails {
@@ -27,9 +27,7 @@ export default function ExportScreen() {
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
   const [exportSuccess, setExportSuccess] = useState('')
-  const [publishers, setPublishers] = useState<Publisher[]>([])
-  const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null)
-  const [publisherPickerVisible, setPublisherPickerVisible] = useState(false)
+  const [activeDeal, setActiveDeal] = useState<{ id: string; publisher_id: string; publisher_name: string } | null>(null)
 
   const isManager = profile?.role === 'manager'
 
@@ -40,7 +38,7 @@ export default function ExportScreen() {
 
   useEffect(() => {
     fetchSongs()
-    fetchPublishers()
+    fetchActiveDeal()
   }, [])
 
   const fetchSongs = async () => {
@@ -87,19 +85,23 @@ export default function ExportScreen() {
     }
   }
 
-  const fetchPublishers = async () => {
+  const fetchActiveDeal = async () => {
     const artistIdForQuery = isManager ? activeArtist?.id : null
     if (!artistIdForQuery) return
-    // Get publishers from active deals
     const { data } = await supabase
       .from('publishing_deals')
-      .select('publisher:publishers(*)')
+      .select('id, publisher_id, publisher:publishers(name)')
       .eq('artist_id', artistIdForQuery)
       .eq('is_active', true)
+      .order('start_date', { ascending: false })
+      .limit(1)
+      .single()
     if (data) {
-      const pubs = data.map((d: any) => d.publisher).filter(Boolean) as Publisher[]
-      setPublishers(pubs)
-      if (pubs.length === 1) setSelectedPublisherId(pubs[0].id)
+      setActiveDeal({
+        id: data.id,
+        publisher_id: data.publisher_id,
+        publisher_name: (data.publisher as any)?.name ?? 'Unknown',
+      })
     }
   }
 
@@ -121,7 +123,6 @@ export default function ExportScreen() {
   const selectedWithDemo = selectedSongs.filter(s => s.hasDemo)
   const selectedWithoutDemo = selectedSongs.filter(s => !s.hasDemo)
   const selectedWithSplitWarning = selectedSongs.filter(s => s.splitWarning)
-  const selectedPublisher = publishers.find(p => p.id === selectedPublisherId)
 
   const sanitizeFilename = (name: string) => {
     return name.replace(/[/\\?%*:|"<>]/g, '').replace(/\s+/g, ' ').trim()
@@ -141,7 +142,7 @@ export default function ExportScreen() {
       console.log('[export] JSZip loaded')
       const zip = new JSZip()
 
-      const publisherName = selectedPublisher?.name ?? 'Publisher'
+      const publisherName = activeDeal?.publisher_name ?? 'Publisher'
       const dateStr = new Date().toISOString().split('T')[0]
       const folderName = `${sanitizeFilename(artistName)}_Export_${dateStr}`
 
@@ -269,8 +270,8 @@ export default function ExportScreen() {
         if (songArtistId) {
           const { data: submissionData, error: subErr } = await supabase.from('submissions').insert({
             artist_id: songArtistId,
-            publisher_id: selectedPublisherId,
-            publisher_name: selectedPublisher?.name ?? 'Unknown',
+            publisher_id: activeDeal?.publisher_id ?? null,
+            publisher_name: activeDeal?.publisher_name ?? 'Unknown',
             submitted_by: profile!.id,
             song_count: selectedSongs.length,
             demo_count: demoCount,
@@ -327,18 +328,12 @@ export default function ExportScreen() {
           </View>
         </View>
 
-        {/* Publisher selector */}
-        {publishers.length > 0 && (
-          <TouchableOpacity
-            style={styles.publisherPicker}
-            onPress={() => setPublisherPickerVisible(true)}
-          >
+        {/* Active deal publisher */}
+        {activeDeal && (
+          <View style={styles.publisherPicker}>
             <Text style={styles.publisherLabel}>Publisher:</Text>
-            <Text style={styles.publisherValue}>
-              {selectedPublisher?.name ?? 'Select publisher...'}
-            </Text>
-            <Ionicons name="chevron-down" size={18} color={Colors.textPrimaryMuted} />
-          </TouchableOpacity>
+            <Text style={styles.publisherValue}>{activeDeal.publisher_name}</Text>
+          </View>
         )}
 
         {/* Include songs without demos toggle */}
@@ -388,7 +383,7 @@ export default function ExportScreen() {
         {/* Song list */}
         {visibleSongs.length === 0 ? (
           <View style={styles.emptyState}>
-            <Ionicons name="document-outline" size={48} color={Colors.textPrimaryMuted} />
+            <Ionicons name="document-outline" size={48} color={Colors.textMuted} />
             <Text style={styles.emptyText}>No complete songs ready for export</Text>
             <Text style={styles.emptySubtext}>Mark songs as "Complete" to include them here</Text>
           </View>
@@ -402,7 +397,7 @@ export default function ExportScreen() {
               <Ionicons
                 name={song.selected ? 'checkbox' : 'square-outline'}
                 size={22}
-                color={song.selected ? Colors.primary : Colors.textPrimaryMuted}
+                color={song.selected ? Colors.primary : Colors.textMuted}
               />
               <View style={styles.songInfo}>
                 <Text style={styles.songTitle}>{song.title}</Text>
@@ -469,36 +464,6 @@ export default function ExportScreen() {
         <View style={{ height: 40 }} />
       </ScrollView>
 
-      {/* Publisher picker modal */}
-      <Modal visible={publisherPickerVisible} transparent animationType="fade">
-        <TouchableOpacity
-          style={styles.modalOverlay}
-          activeOpacity={1}
-          onPress={() => setPublisherPickerVisible(false)}
-        >
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Select Publisher</Text>
-            {publishers.map(pub => (
-              <TouchableOpacity
-                key={pub.id}
-                style={[
-                  styles.modalOption,
-                  selectedPublisherId === pub.id && styles.modalOptionSelected,
-                ]}
-                onPress={() => {
-                  setSelectedPublisherId(pub.id)
-                  setPublisherPickerVisible(false)
-                }}
-              >
-                <Text style={styles.modalOptionText}>{pub.name}</Text>
-                {selectedPublisherId === pub.id && (
-                  <Ionicons name="checkmark" size={20} color={Colors.primary} />
-                )}
-              </TouchableOpacity>
-            ))}
-          </View>
-        </TouchableOpacity>
-      </Modal>
     </SafeAreaView>
   )
 }
@@ -509,7 +474,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: Spacing.lg },
   backBtn: { marginRight: Spacing.sm, padding: 4 },
   title: { fontSize: 22, fontWeight: '700', color: Colors.textPrimary },
-  subtitle: { fontSize: 14, color: Colors.textPrimaryMuted, marginTop: 2 },
+  subtitle: { fontSize: 14, color: Colors.textMuted, marginTop: 2 },
 
   publisherPicker: {
     flexDirection: 'row', alignItems: 'center',
@@ -517,7 +482,7 @@ const styles = StyleSheet.create({
     padding: Spacing.md, marginBottom: Spacing.md,
     borderWidth: 1, borderColor: Colors.border,
   },
-  publisherLabel: { fontSize: 14, color: Colors.textPrimaryMuted, marginRight: 8 },
+  publisherLabel: { fontSize: 14, color: Colors.textMuted, marginRight: 8 },
   publisherValue: { flex: 1, fontSize: 15, color: Colors.textPrimary, fontWeight: '600' },
 
   toggleRow: {
@@ -554,7 +519,7 @@ const styles = StyleSheet.create({
   songRowSelected: { borderColor: Colors.primary, borderWidth: 1.5 },
   songInfo: { flex: 1, marginLeft: 12 },
   songTitle: { fontSize: 15, fontWeight: '600', color: Colors.textPrimary },
-  songMeta: { fontSize: 12, color: Colors.textPrimaryMuted, marginTop: 2 },
+  songMeta: { fontSize: 12, color: Colors.textMuted, marginTop: 2 },
   songBadges: { flexDirection: 'row', gap: 6 },
   badge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   badgeGreen: { backgroundColor: '#059669' },
@@ -564,8 +529,8 @@ const styles = StyleSheet.create({
   badgeTextDark: { fontSize: 11, fontWeight: '600', color: '#1a1a1a' },
 
   emptyState: { alignItems: 'center', paddingVertical: 40 },
-  emptyText: { fontSize: 16, color: Colors.textPrimaryMuted, marginTop: 12 },
-  emptySubtext: { fontSize: 13, color: Colors.textPrimaryMuted, marginTop: 4 },
+  emptyText: { fontSize: 16, color: Colors.textMuted, marginTop: 12 },
+  emptySubtext: { fontSize: 13, color: Colors.textMuted, marginTop: 4 },
 
   errorBanner: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
@@ -587,21 +552,4 @@ const styles = StyleSheet.create({
   },
   exportBtnDisabled: { opacity: 0.6 },
   exportBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
-
-  modalOverlay: {
-    flex: 1, backgroundColor: 'rgba(0,0,0,0.6)',
-    justifyContent: 'center', alignItems: 'center',
-  },
-  modalContent: {
-    backgroundColor: Colors.surface, borderRadius: Radius.lg,
-    padding: Spacing.lg, width: '85%', maxWidth: 400,
-  },
-  modalTitle: { fontSize: 18, fontWeight: '700', color: Colors.textPrimary, marginBottom: Spacing.md },
-  modalOption: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    padding: Spacing.md, borderRadius: Radius.sm,
-    marginBottom: 4,
-  },
-  modalOptionSelected: { backgroundColor: Colors.background },
-  modalOptionText: { fontSize: 15, color: Colors.textPrimary },
 })
