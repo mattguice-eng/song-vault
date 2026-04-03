@@ -12,11 +12,20 @@ import { useAuthStore } from '../../../src/store/authStore'
 import { SongWithDetails } from '../../../src/types/database'
 import { Colors, Spacing, Fonts, Radius } from '../../../src/utils/constants'
 
+interface DealInfo {
+  id: string
+  publisher_id: string
+  publisher_name: string
+  start_date: string
+  end_date: string | null
+}
+
 interface ExportSong extends SongWithDetails {
   selected: boolean
   hasDemo: boolean
   demoFile: { file_url: string; file_name: string } | null
   splitWarning: boolean // splits don't add to 100
+  deal: DealInfo | null // which deal this song falls under by date
 }
 
 export default function ExportScreen() {
@@ -25,9 +34,10 @@ export default function ExportScreen() {
   const [loading, setLoading] = useState(true)
   const [includeNoDemos, setIncludeNoDemos] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [exportProgress, setExportProgress] = useState('')
   const [exportError, setExportError] = useState('')
   const [exportSuccess, setExportSuccess] = useState('')
-  const [activeDeal, setActiveDeal] = useState<{ id: string; publisher_id: string; publisher_name: string } | null>(null)
+  const [deals, setDeals] = useState<DealInfo[]>([])
 
   const isManager = profile?.role === 'manager'
 
@@ -37,11 +47,10 @@ export default function ExportScreen() {
     : profile?.full_name ?? 'Artist'
 
   useEffect(() => {
-    fetchSongs()
-    fetchActiveDeal()
+    fetchDeals()
   }, [])
 
-  const fetchSongs = async () => {
+  const fetchSongs = async (dealList: DealInfo[]) => {
     if (!profile) { setLoading(false); return }
     if (isManager && !activeArtist) { setLoading(false); return }
     try {
@@ -68,12 +77,14 @@ export default function ExportScreen() {
       const exportSongs: ExportSong[] = (data ?? []).map((s: any) => {
         const demoFile = s.files?.find((f: any) => f.file_type === 'demo') ?? null
         const totalSplits = (s.cowriters ?? []).reduce((sum: number, c: any) => sum + (c.split_percentage ?? 0), 0)
+        const deal = matchSongToDeal(s.date_written, dealList)
         return {
           ...s,
-          selected: true, // default all selected
+          selected: true,
           hasDemo: !!demoFile,
           demoFile: demoFile ? { file_url: demoFile.file_url, file_name: demoFile.file_name } : null,
           splitWarning: Math.abs(totalSplits - 100) > 0.1,
+          deal,
         }
       })
 
@@ -85,24 +96,36 @@ export default function ExportScreen() {
     }
   }
 
-  const fetchActiveDeal = async () => {
+  const matchSongToDeal = (dateWritten: string | null, dealList: DealInfo[]): DealInfo | null => {
+    if (!dateWritten || dealList.length === 0) return dealList[0] ?? null // fallback to most recent
+    for (const deal of dealList) {
+      const songDate = new Date(dateWritten + 'T12:00:00')
+      const dealStart = new Date(deal.start_date + 'T00:00:00')
+      const dealEnd = deal.end_date ? new Date(deal.end_date + 'T23:59:59') : null
+      if (songDate >= dealStart && (!dealEnd || songDate <= dealEnd)) {
+        return deal
+      }
+    }
+    return null // song doesn't fall under any deal
+  }
+
+  const fetchDeals = async () => {
     const artistIdForQuery = isManager ? activeArtist?.id : null
-    if (!artistIdForQuery) return
+    if (!artistIdForQuery) { fetchSongs([]); return }
     const { data } = await supabase
       .from('publishing_deals')
-      .select('id, publisher_id, publisher:publishers(name)')
+      .select('id, publisher_id, start_date, end_date, publisher:publishers(name)')
       .eq('artist_id', artistIdForQuery)
-      .eq('is_active', true)
       .order('start_date', { ascending: false })
-      .limit(1)
-      .single()
-    if (data) {
-      setActiveDeal({
-        id: data.id,
-        publisher_id: data.publisher_id,
-        publisher_name: (data.publisher as any)?.name ?? 'Unknown',
-      })
-    }
+    const dealList: DealInfo[] = (data ?? []).map((d: any) => ({
+      id: d.id,
+      publisher_id: d.publisher_id,
+      publisher_name: (d.publisher as any)?.name ?? 'Unknown',
+      start_date: d.start_date,
+      end_date: d.end_date,
+    }))
+    setDeals(dealList)
+    fetchSongs(dealList)
   }
 
   const toggleSong = (songId: string) => {
@@ -137,12 +160,15 @@ export default function ExportScreen() {
 
     try {
       console.log('[export] Starting export for', selectedSongs.length, 'songs')
+      setExportProgress('Preparing export...')
       // Dynamic import JSZip (only needed on export)
       const JSZip = (await import('jszip')).default
       console.log('[export] JSZip loaded')
       const zip = new JSZip()
 
-      const publisherName = activeDeal?.publisher_name ?? 'Publisher'
+      // Use the first selected song's deal publisher for the folder name
+      const primaryDeal = selectedSongs[0]?.deal
+      const publisherName = primaryDeal?.publisher_name ?? 'Publisher'
       const dateStr = new Date().toISOString().split('T')[0]
       const folderName = `${sanitizeFilename(artistName)}_Export_${dateStr}`
 
@@ -162,6 +188,7 @@ export default function ExportScreen() {
       const csvContent = [csvHeaders.join(','), ...csvRows].join('\n')
       zip.file(`${folderName}/songs_export.csv`, csvContent)
       console.log('[export] CSV generated')
+      setExportProgress('Generating lyrics files...')
 
       // ── 2. Generate lyrics files ─────────────────────────────────────
       const lyricsFolder = zip.folder(`${folderName}/lyrics`)!
@@ -190,6 +217,7 @@ export default function ExportScreen() {
         const song = songsWithDemos[i]
         try {
           console.log(`[export] Demo ${i + 1}/${songsWithDemos.length}: ${song.title}`)
+          setExportProgress(`Downloading demo ${i + 1} of ${songsWithDemos.length}...`)
           // Get a fresh signed URL for download
           const raw = song.demoFile!.file_url.split('/song-files/')[1]
           if (!raw) { console.warn('[export] No storage path for:', song.title); continue }
@@ -232,6 +260,7 @@ export default function ExportScreen() {
       console.log('[export] Demo downloads complete:', demoCount, 'of', songsWithDemos.length)
 
       // ── 4. Generate zip and trigger download ─────────────────────────
+      setExportProgress('Building zip file...')
       console.log('[export] Generating zip...')
       const zipBlob = await zip.generateAsync({ type: 'blob' })
       console.log('[export] Zip generated, size:', zipBlob.size)
@@ -270,8 +299,8 @@ export default function ExportScreen() {
         if (songArtistId) {
           const { data: submissionData, error: subErr } = await supabase.from('submissions').insert({
             artist_id: songArtistId,
-            publisher_id: activeDeal?.publisher_id ?? null,
-            publisher_name: activeDeal?.publisher_name ?? 'Unknown',
+            publisher_id: primaryDeal?.publisher_id ?? null,
+            publisher_name: primaryDeal?.publisher_name ?? 'Unknown',
             submitted_by: profile!.id,
             song_count: selectedSongs.length,
             demo_count: demoCount,
@@ -328,11 +357,15 @@ export default function ExportScreen() {
           </View>
         </View>
 
-        {/* Active deal publisher */}
-        {activeDeal && (
+        {/* Active deals */}
+        {deals.length > 0 && (
           <View style={styles.publisherPicker}>
-            <Text style={styles.publisherLabel}>Publisher:</Text>
-            <Text style={styles.publisherValue}>{activeDeal.publisher_name}</Text>
+            <Text style={styles.publisherLabel}>
+              {deals.length === 1 ? 'Publisher:' : 'Deals:'}
+            </Text>
+            <Text style={styles.publisherValue}>
+              {deals.map(d => d.publisher_name).filter((v, i, a) => a.indexOf(v) === i).join(', ')}
+            </Text>
           </View>
         )}
 
@@ -406,6 +439,9 @@ export default function ExportScreen() {
                   {' \u2022 '}
                   {(song.cowriters ?? []).map(c => c.name).join(', ') || 'No writers'}
                 </Text>
+                {song.deal && deals.length > 1 && (
+                  <Text style={styles.songDeal}>{song.deal.publisher_name}</Text>
+                )}
               </View>
               <View style={styles.songBadges}>
                 {song.hasDemo ? (
@@ -443,6 +479,13 @@ export default function ExportScreen() {
 
         {/* Export button */}
         {selectedSongs.length > 0 && (
+          <>
+          {exporting && exportProgress ? (
+            <View style={styles.progressBar}>
+              <ActivityIndicator size="small" color={Colors.primary} />
+              <Text style={styles.progressText}>{exportProgress}</Text>
+            </View>
+          ) : null}
           <TouchableOpacity
             style={[styles.exportBtn, exporting && styles.exportBtnDisabled]}
             onPress={handleExport}
@@ -459,6 +502,7 @@ export default function ExportScreen() {
               </>
             )}
           </TouchableOpacity>
+          </>
         )}
 
         <View style={{ height: 40 }} />
@@ -519,7 +563,8 @@ const styles = StyleSheet.create({
   songRowSelected: { borderColor: Colors.primary, borderWidth: 1.5 },
   songInfo: { flex: 1, marginLeft: 12 },
   songTitle: { fontSize: 15, fontWeight: '600', color: Colors.textPrimary },
-  songMeta: { fontSize: 12, color: Colors.textMuted, marginTop: 2 },
+  songMeta: { fontSize: 12, color: Colors.textSecondary, marginTop: 2 },
+  songDeal: { fontSize: 11, color: Colors.primary, marginTop: 2 },
   songBadges: { flexDirection: 'row', gap: 6 },
   badge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   badgeGreen: { backgroundColor: '#059669' },
@@ -552,4 +597,11 @@ const styles = StyleSheet.create({
   },
   exportBtnDisabled: { opacity: 0.6 },
   exportBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  progressBar: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    backgroundColor: Colors.surface, borderRadius: Radius.md,
+    padding: Spacing.md, marginTop: Spacing.md,
+    borderWidth: 1, borderColor: Colors.border,
+  },
+  progressText: { fontSize: 14, color: Colors.textSecondary },
 })
